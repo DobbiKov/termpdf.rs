@@ -86,6 +86,7 @@ impl<W: Write> KittyRenderer<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState};
 
     #[test]
     fn kitty_draw_emits_protocol() {
@@ -102,6 +103,55 @@ mod tests {
         assert_eq!(output[1], b'_');
         assert_eq!(output[2], b'G');
     }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn event_mapper_uses_numeric_prefix_for_next_page() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('1'))), UiEvent::None));
+        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('2'))), UiEvent::None));
+
+        match mapper.map_event(key_event(KeyCode::Char('j'))) {
+            UiEvent::Command(Command::NextPage { count }) => assert_eq!(count, 12),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_resets_prefix_after_use() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('3'))), UiEvent::None));
+
+        match mapper.map_event(key_event(KeyCode::Char('k'))) {
+            UiEvent::Command(Command::PrevPage { count }) => assert_eq!(count, 3),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Char('k'))) {
+            UiEvent::Command(Command::PrevPage { count }) => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_drops_prefix_on_other_command() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('4'))), UiEvent::None));
+        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('q'))), UiEvent::Quit));
+
+        match mapper.map_event(key_event(KeyCode::Char('j'))) {
+            UiEvent::Command(Command::NextPage { count }) => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,31 +161,91 @@ pub enum UiEvent {
     None,
 }
 
-pub fn map_event(event: Event) -> UiEvent {
-    match event {
-        Event::Key(KeyEvent {
-            code, modifiers, ..
-        }) => match (code, modifiers) {
-            (KeyCode::Char('q'), _) => UiEvent::Quit,
-            (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
-                UiEvent::Command(Command::NextPage { count: 1 })
-            }
-            (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, KeyModifiers::NONE) => {
-                UiEvent::Command(Command::PrevPage { count: 1 })
-            }
-            (KeyCode::Char('+'), _) => UiEvent::Command(Command::ScaleBy { factor: 1.1 }),
-            (KeyCode::Char('-'), _) => UiEvent::Command(Command::ScaleBy { factor: 0.9 }),
-            (KeyCode::Char('d'), _) => UiEvent::Command(Command::ToggleDarkMode),
-            (KeyCode::Char('g'), KeyModifiers::NONE) => {
-                UiEvent::Command(Command::GotoPage { page: 0 })
-            }
-            (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => {
-                UiEvent::Command(Command::GotoPage { page: usize::MAX })
-            }
-            _ => UiEvent::None,
-        },
-        _ => UiEvent::None,
+#[derive(Debug, Default)]
+pub struct EventMapper {
+    pending_count: Option<usize>,
+}
+
+impl EventMapper {
+    pub fn new() -> Self {
+        Self::default()
     }
+
+    pub fn map_event(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Char(c), KeyModifiers::NONE) if c.is_ascii_digit() => {
+                    if let Some(digit) = c.to_digit(10) {
+                        self.push_digit(digit as usize);
+                    }
+                    UiEvent::None
+                }
+                (KeyCode::Char('j'), KeyModifiers::NONE)
+                | (KeyCode::Down, KeyModifiers::NONE) => {
+                    let count = self.take_count();
+                    UiEvent::Command(Command::NextPage { count })
+                }
+                (KeyCode::Char('k'), KeyModifiers::NONE)
+                | (KeyCode::Up, KeyModifiers::NONE) => {
+                    let count = self.take_count();
+                    UiEvent::Command(Command::PrevPage { count })
+                }
+                (KeyCode::Char('q'), _) => {
+                    self.reset_count();
+                    UiEvent::Quit
+                }
+                (KeyCode::Char('+'), _) => {
+                    self.reset_count();
+                    UiEvent::Command(Command::ScaleBy { factor: 1.1 })
+                }
+                (KeyCode::Char('-'), _) => {
+                    self.reset_count();
+                    UiEvent::Command(Command::ScaleBy { factor: 0.9 })
+                }
+                (KeyCode::Char('d'), _) => {
+                    self.reset_count();
+                    UiEvent::Command(Command::ToggleDarkMode)
+                }
+                (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    self.reset_count();
+                    UiEvent::Command(Command::GotoPage { page: 0 })
+                }
+                (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => {
+                    self.reset_count();
+                    UiEvent::Command(Command::GotoPage { page: usize::MAX })
+                }
+                _ => {
+                    self.reset_count();
+                    UiEvent::None
+                }
+            },
+            _ => UiEvent::None,
+        }
+    }
+
+    fn push_digit(&mut self, digit: usize) {
+        let current = self.pending_count.unwrap_or(0);
+        let next = current.saturating_mul(10).saturating_add(digit);
+        self.pending_count = Some(next);
+    }
+
+    fn take_count(&mut self) -> usize {
+        self.pending_count
+            .take()
+            .filter(|&count| count > 0)
+            .unwrap_or(1)
+    }
+
+    fn reset_count(&mut self) {
+        self.pending_count = None;
+    }
+}
+
+#[deprecated(note = "Use EventMapper to retain numeric prefixes between key events")]
+pub fn map_event(event: Event) -> UiEvent {
+    EventMapper::new().map_event(event)
 }
 
 pub fn write_status_line<W: Write>(writer: &mut W, label: &str) -> io::Result<()> {

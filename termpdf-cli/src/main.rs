@@ -7,12 +7,11 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::cursor;
 use crossterm::event;
-use crossterm::event::Event;
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{Command, FileStateStore, RenderImage, Session, StateStore};
 use termpdf_render::PdfRenderFactory;
-use termpdf_tty::{map_event, write_status_line, DrawParams, KittyRenderer, UiEvent};
+use termpdf_tty::{write_status_line, DrawParams, EventMapper, KittyRenderer, UiEvent};
 use tracing::warn;
 
 #[derive(Debug, Parser)]
@@ -78,6 +77,7 @@ async fn main() -> Result<()> {
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, cursor::Hide)?;
     let mut renderer = KittyRenderer::new(stdout);
+    let mut event_mapper = EventMapper::new();
     let mut dirty = true;
 
     loop {
@@ -88,7 +88,8 @@ async fn main() -> Result<()> {
 
         if event::poll(Duration::from_millis(100))? {
             let ev = event::read()?;
-            match handle_event(ev, &mut session)? {
+            let ui_event = event_mapper.map_event(ev);
+            match handle_event(ui_event, &mut session)? {
                 LoopAction::ContinueRedraw => dirty = true,
                 LoopAction::Continue => {}
                 LoopAction::Quit => break,
@@ -106,8 +107,8 @@ enum LoopAction {
     Quit,
 }
 
-fn handle_event(ev: Event, session: &mut Session) -> Result<LoopAction> {
-    match map_event(ev) {
+fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
+    match event {
         UiEvent::Command(cmd) => {
             let redraw = matches!(
                 cmd,
