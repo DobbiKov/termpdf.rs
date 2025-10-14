@@ -10,9 +10,9 @@ use crossterm::event;
 use crossterm::event::Event;
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
-use termpdf_core::{Command, FileStateStore, Session, StateStore};
+use termpdf_core::{Command, FileStateStore, RenderImage, Session, StateStore};
 use termpdf_render::PdfRenderFactory;
-use termpdf_tty::{map_event, write_status_line, KittyRenderer, UiEvent};
+use termpdf_tty::{map_event, write_status_line, DrawParams, KittyRenderer, UiEvent};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -130,14 +130,61 @@ fn handle_event(ev: Event, session: &mut Session) -> Result<LoopAction> {
 }
 
 fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result<()> {
-    {
-        let mut writer = renderer.writer();
-        crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-    }
-
     if let Some(doc) = session.active() {
-        let image = doc.render()?;
-        renderer.draw(&image)?;
+        let window = terminal::window_size()?;
+        let total_cols = u32::from(window.columns).max(1);
+        let total_rows = u32::from(window.rows).max(1);
+        let pixel_width = u32::from(window.width);
+        let pixel_height = u32::from(window.height);
+
+        let image_rows_available = total_rows.saturating_sub(1).max(1);
+        let margin_cols = total_cols.min(2);
+        let margin_rows = image_rows_available.min(2);
+        let available_cols = total_cols.saturating_sub(margin_cols).max(1);
+        let available_rows = image_rows_available.saturating_sub(margin_rows).max(1);
+
+        let base_scale = doc.state.scale;
+        let mut image = doc.render_with_scale(base_scale)?;
+
+        if pixel_width > 0 && pixel_height > 0 && image.width > 0 && image.height > 0 {
+            let cell_width = pixel_width as f32 / total_cols as f32;
+            let cell_height = pixel_height as f32 / total_rows as f32;
+            let desired_pixel_width = cell_width * available_cols as f32;
+            let desired_pixel_height = cell_height * available_rows as f32;
+            if desired_pixel_width > 0.0 && desired_pixel_height > 0.0 {
+                let width_ratio = desired_pixel_width / image.width as f32;
+                let height_ratio = desired_pixel_height / image.height as f32;
+                let scale_ratio = width_ratio.min(height_ratio);
+                if scale_ratio > 1.05 {
+                    let target_scale = (base_scale * scale_ratio).min(8.0);
+                    image = doc.render_with_scale(target_scale)?;
+                }
+            }
+        }
+
+        let (draw_cols, draw_rows) = compute_scaled_dimensions(
+            &image,
+            available_cols,
+            available_rows,
+            total_cols,
+            total_rows,
+            pixel_width,
+            pixel_height,
+        );
+
+        let start_col = (total_cols.saturating_sub(draw_cols)) / 2;
+        let start_row = (image_rows_available.saturating_sub(draw_rows)) / 2;
+
+        {
+            let mut writer = renderer.writer();
+            crossterm::execute!(
+                &mut writer,
+                Clear(ClearType::All),
+                cursor::MoveTo(start_col as u16, start_row as u16)
+            )?;
+        }
+
+        renderer.draw(&image, DrawParams::clamped(draw_cols, draw_rows))?;
         let info = &doc.info;
         let status = format!(
             "{} — page {}/{}",
@@ -148,16 +195,77 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
             doc.state.current_page + 1,
             info.page_count
         );
-        let (_, rows) = terminal::size()?;
+        let status_row = total_rows.saturating_sub(1);
         {
             let mut writer = renderer.writer();
             crossterm::execute!(
                 &mut writer,
-                cursor::MoveTo(0, rows.saturating_sub(1)),
+                cursor::MoveTo(0, status_row as u16),
                 Clear(ClearType::CurrentLine)
             )?;
             write_status_line(&mut writer, &status)?;
         }
     }
     Ok(())
+}
+
+fn compute_scaled_dimensions(
+    image: &RenderImage,
+    available_cols: u32,
+    available_rows: u32,
+    total_cols: u32,
+    total_rows: u32,
+    pixel_width: u32,
+    pixel_height: u32,
+) -> (u32, u32) {
+    let mut draw_cols = available_cols.max(1);
+    let mut draw_rows = available_rows.max(1);
+
+    if image.width == 0 || image.height == 0 {
+        return (draw_cols, draw_rows);
+    }
+
+    if pixel_width > 0 && pixel_height > 0 && total_cols > 0 && total_rows > 0 {
+        let cell_width = pixel_width as f32 / total_cols as f32;
+        let cell_height = pixel_height as f32 / total_rows as f32;
+        let avail_pixel_width = cell_width * available_cols as f32;
+        let avail_pixel_height = cell_height * available_rows as f32;
+
+        if avail_pixel_width > 0.0 && avail_pixel_height > 0.0 {
+            let scale_w = avail_pixel_width / image.width as f32;
+            let scale_h = avail_pixel_height / image.height as f32;
+            let scale = scale_w.min(scale_h).max(0.01);
+            let scaled_pixel_width = image.width as f32 * scale;
+            let scaled_pixel_height = image.height as f32 * scale;
+            let mut cols = (scaled_pixel_width / cell_width).round().max(1.0);
+            let mut rows = (scaled_pixel_height / cell_height).round().max(1.0);
+            if cols > available_cols as f32 {
+                cols = available_cols as f32;
+            }
+            if rows > available_rows as f32 {
+                rows = available_rows as f32;
+            }
+            draw_cols = cols as u32;
+            draw_rows = rows as u32;
+        }
+    } else {
+        let ratio = image.width as f32 / image.height as f32;
+        if ratio.is_finite() && ratio > 0.0 {
+            let mut cols = available_cols as f32;
+            let mut rows = (cols / ratio).round().max(1.0);
+
+            if rows > available_rows as f32 {
+                rows = available_rows as f32;
+                cols = (rows * ratio).round().max(1.0);
+            }
+
+            draw_cols = cols.min(available_cols as f32) as u32;
+            draw_rows = rows.min(available_rows as f32) as u32;
+        }
+    }
+
+    draw_cols = draw_cols.max(1).min(available_cols);
+    draw_rows = draw_rows.max(1).min(available_rows);
+
+    (draw_cols, draw_rows)
 }

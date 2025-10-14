@@ -88,9 +88,13 @@ impl DocumentInstance {
     }
 
     pub fn render(&self) -> Result<RenderImage> {
+        self.render_with_scale(self.state.scale)
+    }
+
+    pub fn render_with_scale(&self, scale: f32) -> Result<RenderImage> {
         let request = RenderRequest {
             page_index: self.state.current_page,
-            scale: self.state.scale,
+            scale,
             dark_mode: self.state.dark_mode,
         };
         self.backend.render_page(request)

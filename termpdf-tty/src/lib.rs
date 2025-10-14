@@ -11,6 +11,20 @@ pub struct KittyRenderer<W: Write> {
     writer: W,
 }
 
+pub struct DrawParams {
+    pub columns: u32,
+    pub rows: u32,
+}
+
+impl DrawParams {
+    pub fn clamped(columns: u32, rows: u32) -> Self {
+        Self {
+            columns: columns.max(1),
+            rows: rows.max(1),
+        }
+    }
+}
+
 impl<W: Write> KittyRenderer<W> {
     pub fn new(writer: W) -> Self {
         Self { writer }
@@ -20,7 +34,7 @@ impl<W: Write> KittyRenderer<W> {
         &mut self.writer
     }
 
-    pub fn draw(&mut self, image: &RenderImage) -> Result<()> {
+    pub fn draw(&mut self, image: &RenderImage, params: DrawParams) -> Result<()> {
         let mut buffer = Vec::new();
         let mut encoder = Encoder::new(&mut buffer, image.width, image.height);
         encoder.set_color(ColorType::Rgba);
@@ -38,7 +52,9 @@ impl<W: Write> KittyRenderer<W> {
             if first {
                 write!(
                     self.writer,
-                    "\u{1b}_Ga=T,f=100,C=1,q=2,s={},v={},m={}",
+                    "\u{1b}_Ga=T,f=100,C=1,q=2,c={},r={},s={},v={},m={}",
+                    params.columns,
+                    params.rows,
                     image.width,
                     image.height,
                     if more { 1 } else { 0 }
@@ -72,7 +88,7 @@ mod tests {
             pixels: vec![255, 0, 0, 255],
         };
 
-        renderer.draw(&image).unwrap();
+        renderer.draw(&image, DrawParams::clamped(10, 5)).unwrap();
         let output = renderer.writer;
         assert_eq!(output[0], 0x1b);
         assert_eq!(output[1], b'_');
