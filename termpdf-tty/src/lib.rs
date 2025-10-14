@@ -9,6 +9,8 @@ use termpdf_core::{Command, RenderImage};
 
 pub struct KittyRenderer<W: Write> {
     writer: W,
+    image_id: u32,
+    placement_id: u32,
 }
 
 pub struct DrawParams {
@@ -27,7 +29,11 @@ impl DrawParams {
 
 impl<W: Write> KittyRenderer<W> {
     pub fn new(writer: W) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            image_id: 1,
+            placement_id: 1,
+        }
     }
 
     pub fn writer(&mut self) -> &mut W {
@@ -52,7 +58,9 @@ impl<W: Write> KittyRenderer<W> {
             if first {
                 write!(
                     self.writer,
-                    "\u{1b}_Ga=T,f=100,C=1,q=2,c={},r={},s={},v={},m={}",
+                    "\u{1b}_Ga=T,f=100,C=1,q=2,i={},p={},c={},r={},s={},v={},m={}",
+                    self.image_id,
+                    self.placement_id,
                     params.columns,
                     params.rows,
                     image.width,

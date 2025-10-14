@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -72,6 +72,7 @@ pub struct DocumentInstance {
     pub info: DocumentInfo,
     pub backend: Arc<dyn DocumentBackend>,
     pub state: PersistedDocumentState,
+    render_cache: Mutex<HashMap<CacheKey, RenderImage>>,
 }
 
 impl DocumentInstance {
@@ -84,6 +85,7 @@ impl DocumentInstance {
             info,
             backend,
             state,
+            render_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -92,12 +94,124 @@ impl DocumentInstance {
     }
 
     pub fn render_with_scale(&self, scale: f32) -> Result<RenderImage> {
-        let request = RenderRequest {
-            page_index: self.state.current_page,
+        self.render_page_internal(
+            self.state.current_page,
             scale,
-            dark_mode: self.state.dark_mode,
+            self.state.dark_mode,
+            self.state.current_page,
+        )
+    }
+
+    pub fn prefetch_neighbors(&self, range: usize, scale: f32) -> Result<()> {
+        if range == 0 {
+            return Ok(());
+        }
+
+        let current_page = self.state.current_page;
+        let dark_mode = self.state.dark_mode;
+        let mut last_error: Option<Error> = None;
+
+        for offset in 1..=range {
+            if let Some(prev) = current_page.checked_sub(offset) {
+                if prev < self.info.page_count {
+                    if let Err(err) =
+                        self.render_page_internal(prev, scale, dark_mode, current_page)
+                    {
+                        last_error = Some(err);
+                    }
+                }
+            }
+
+            let next = current_page + offset;
+            if next < self.info.page_count {
+                if let Err(err) = self.render_page_internal(next, scale, dark_mode, current_page) {
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn render_page_internal(
+        &self,
+        page_index: usize,
+        scale: f32,
+        dark_mode: bool,
+        reference_page: usize,
+    ) -> Result<RenderImage> {
+        if page_index >= self.info.page_count {
+            return Err(anyhow!("page {} out of range", page_index));
+        }
+
+        let key = CacheKey::new(page_index, scale, dark_mode);
+        if let Some(image) = self.try_get_cached(&key) {
+            return Ok(image);
+        }
+
+        let request = RenderRequest {
+            page_index,
+            scale,
+            dark_mode,
         };
-        self.backend.render_page(request)
+        let image = self.backend.render_page(request)?;
+        self.store_cached_render(key, &image, reference_page);
+        Ok(image)
+    }
+
+    fn try_get_cached(&self, key: &CacheKey) -> Option<RenderImage> {
+        self.render_cache.lock().get(key).cloned()
+    }
+
+    fn store_cached_render(&self, key: CacheKey, image: &RenderImage, reference_page: usize) {
+        let mut cache = self.render_cache.lock();
+        cache.insert(key, image.clone());
+
+        if cache.len() > CACHE_CAPACITY {
+            let mut keys: Vec<_> = cache.keys().cloned().collect();
+            keys.sort_by_key(|k| k.distance(reference_page));
+            for stale in keys.into_iter().skip(CACHE_CAPACITY) {
+                cache.remove(&stale);
+            }
+        }
+    }
+}
+
+const CACHE_CAPACITY: usize = 10;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct CacheKey {
+    page_index: usize,
+    scale_milli: u32,
+    dark_mode: bool,
+}
+
+impl CacheKey {
+    fn new(page_index: usize, scale: f32, dark_mode: bool) -> Self {
+        Self {
+            page_index,
+            scale_milli: quantize_scale(scale),
+            dark_mode,
+        }
+    }
+
+    fn distance(&self, reference_page: usize) -> usize {
+        self.page_index.abs_diff(reference_page)
+    }
+}
+
+fn quantize_scale(scale: f32) -> u32 {
+    let scaled = (scale * 1000.0).round();
+    if !scaled.is_finite() || scaled <= 0.0 {
+        1
+    } else if scaled > u32::MAX as f32 {
+        u32::MAX
+    } else {
+        scaled as u32
     }
 }
 

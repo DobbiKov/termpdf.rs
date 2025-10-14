@@ -13,6 +13,7 @@ use directories::ProjectDirs;
 use termpdf_core::{Command, FileStateStore, RenderImage, Session, StateStore};
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{map_event, write_status_line, DrawParams, KittyRenderer, UiEvent};
+use tracing::warn;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -144,6 +145,7 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
         let available_rows = image_rows_available.saturating_sub(margin_rows).max(1);
 
         let base_scale = doc.state.scale;
+        let mut render_scale = base_scale;
         let mut image = doc.render_with_scale(base_scale)?;
 
         if pixel_width > 0 && pixel_height > 0 && image.width > 0 && image.height > 0 {
@@ -157,6 +159,7 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
                 let scale_ratio = width_ratio.min(height_ratio);
                 if scale_ratio > 1.05 {
                     let target_scale = (base_scale * scale_ratio).min(8.0);
+                    render_scale = target_scale;
                     image = doc.render_with_scale(target_scale)?;
                 }
             }
@@ -179,7 +182,6 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
             let mut writer = renderer.writer();
             crossterm::execute!(
                 &mut writer,
-                Clear(ClearType::All),
                 cursor::MoveTo(start_col as u16, start_row as u16)
             )?;
         }
@@ -204,6 +206,14 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
                 Clear(ClearType::CurrentLine)
             )?;
             write_status_line(&mut writer, &status)?;
+        }
+
+        if let Err(err) = doc.prefetch_neighbors(2, render_scale) {
+            warn!(
+                ?err,
+                page = doc.state.current_page,
+                "failed to prefetch neighboring pages"
+            );
         }
     }
     Ok(())
