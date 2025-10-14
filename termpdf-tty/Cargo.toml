@@ -1,0 +1,17 @@
+[package]
+name = "termpdf-tty"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossterm = { workspace = true }
+bytes = { workspace = true }
+png = { workspace = true }
+base64 = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+termpdf-core = { path = "../termpdf-core" }
