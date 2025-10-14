@@ -116,8 +116,14 @@ mod tests {
     #[test]
     fn event_mapper_uses_numeric_prefix_for_next_page() {
         let mut mapper = EventMapper::new();
-        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('1'))), UiEvent::None));
-        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('2'))), UiEvent::None));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('1'))),
+            UiEvent::None
+        ));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('2'))),
+            UiEvent::None
+        ));
 
         match mapper.map_event(key_event(KeyCode::Char('j'))) {
             UiEvent::Command(Command::NextPage { count }) => assert_eq!(count, 12),
@@ -128,7 +134,10 @@ mod tests {
     #[test]
     fn event_mapper_resets_prefix_after_use() {
         let mut mapper = EventMapper::new();
-        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('3'))), UiEvent::None));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('3'))),
+            UiEvent::None
+        ));
 
         match mapper.map_event(key_event(KeyCode::Char('k'))) {
             UiEvent::Command(Command::PrevPage { count }) => assert_eq!(count, 3),
@@ -144,8 +153,14 @@ mod tests {
     #[test]
     fn event_mapper_drops_prefix_on_other_command() {
         let mut mapper = EventMapper::new();
-        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('4'))), UiEvent::None));
-        assert!(matches!(mapper.map_event(key_event(KeyCode::Char('q'))), UiEvent::Quit));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('4'))),
+            UiEvent::None
+        ));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('q'))),
+            UiEvent::Quit
+        ));
 
         match mapper.map_event(key_event(KeyCode::Char('j'))) {
             UiEvent::Command(Command::NextPage { count }) => assert_eq!(count, 1),
@@ -182,13 +197,11 @@ impl EventMapper {
                     }
                     UiEvent::None
                 }
-                (KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Down, KeyModifiers::NONE) => {
+                (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
                     let count = self.take_count();
                     UiEvent::Command(Command::NextPage { count })
                 }
-                (KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Up, KeyModifiers::NONE) => {
+                (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, KeyModifiers::NONE) => {
                     let count = self.take_count();
                     UiEvent::Command(Command::PrevPage { count })
                 }

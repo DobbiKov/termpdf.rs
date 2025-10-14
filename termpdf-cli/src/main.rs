@@ -79,9 +79,17 @@ async fn main() -> Result<()> {
     let mut renderer = KittyRenderer::new(stdout);
     let mut event_mapper = EventMapper::new();
     let mut dirty = true;
+    let mut needs_initial_clear = true;
 
     loop {
         if dirty {
+            if needs_initial_clear {
+                {
+                    let mut writer = renderer.writer();
+                    crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+                }
+                needs_initial_clear = false;
+            }
             redraw(&mut renderer, &session)?;
             dirty = false;
         }
@@ -95,6 +103,11 @@ async fn main() -> Result<()> {
                 LoopAction::Quit => break,
             }
         }
+    }
+
+    {
+        let mut writer = renderer.writer();
+        crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     }
 
     session.persist()?;
