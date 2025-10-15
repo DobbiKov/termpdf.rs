@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +14,8 @@ use termpdf_core::{Command, FileStateStore, RenderImage, Session, StateStore};
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{write_status_line, DrawParams, EventMapper, KittyRenderer, UiEvent};
 use tracing::warn;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -49,7 +52,6 @@ impl Drop for RawModeGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
     let args = Args::parse();
     if args.files.is_empty() {
         return Err(anyhow!("no input files provided"));
@@ -57,6 +59,7 @@ async fn main() -> Result<()> {
 
     let project_dirs = ProjectDirs::from("net", "termpdf", "termpdf")
         .ok_or_else(|| anyhow!("unable to resolve platform data directories"))?;
+    let _log_guard = init_logging(&project_dirs)?;
     let state_dir = project_dirs.data_local_dir().join("state");
     let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(state_dir.clone())?);
     let mut session = Session::new(store);
@@ -134,6 +137,7 @@ fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
                     | Command::NextPage { .. }
                     | Command::PrevPage { .. }
                     | Command::ScaleBy { .. }
+                    | Command::GotoMark { .. }
                     | Command::ToggleDarkMode
                     | Command::SwitchDocument { .. }
             );
@@ -275,6 +279,29 @@ fn draw_status_line(renderer: &mut KittyRenderer<io::Stdout>, status: &str) -> R
     )?;
     write_status_line(&mut writer, status)?;
     Ok(())
+}
+
+fn init_logging(project_dirs: &ProjectDirs) -> Result<WorkerGuard> {
+    let log_dir = project_dirs.data_local_dir().join("logs");
+    fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::never(log_dir, "termpdf.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(file_writer);
+    let console_layer = tracing_subscriber::fmt::layer();
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(file_layer)
+        .with(console_layer)
+        .try_init()
+        .map_err(|err| anyhow!(err))?;
+
+    Ok(guard)
 }
 
 fn compute_scaled_dimensions(

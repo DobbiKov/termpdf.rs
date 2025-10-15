@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Error, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 pub type DocumentId = Uuid;
@@ -362,12 +362,18 @@ impl Session {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     let curr_page = doc.state.current_page;
                     doc.add_mark(key, curr_page);
+                    let marks_snapshot = doc.state.marks.clone();
                 }
             }
             Command::GotoMark { key } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     let curr_page = doc.state.current_page;
-                    let page = doc.get_page_from_mark(key).unwrap_or(10);
+                    let (target_page, resolved_page) = match doc.get_page_from_mark(key) {
+                        Some(page) => (Some(page), page),
+                        None => (None, 10),
+                    };
+                    let marks_snapshot = doc.state.marks.clone();
+                    let page = resolved_page;
                     // TODO: return
                     // error
                     let next = page.min(doc.info.page_count.saturating_sub(1));

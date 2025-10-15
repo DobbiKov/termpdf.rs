@@ -342,7 +342,11 @@ impl EventMapper {
         if !self.char_stack.is_empty() {
             pending.push_str(&self.char_stack);
         }
-        if pending.is_empty() { None } else { Some(pending) }
+        if pending.is_empty() {
+            None
+        } else {
+            Some(pending)
+        }
     }
 }
 
