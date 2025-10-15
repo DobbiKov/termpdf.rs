@@ -238,8 +238,21 @@ fn redraw(
             }
         }
 
+        let effective_pixel_width = if zoom_scale > 1.0 {
+            display_image.width as f32 * zoom_scale
+        } else {
+            display_image.width as f32
+        };
+        let effective_pixel_height = if zoom_scale > 1.0 {
+            display_image.height as f32 * zoom_scale
+        } else {
+            display_image.height as f32
+        };
+
         let (draw_cols, draw_rows) = compute_scaled_dimensions(
             &display_image,
+            effective_pixel_width,
+            effective_pixel_height,
             available_cols,
             available_rows,
             total_cols,
@@ -332,6 +345,8 @@ fn init_logging(project_dirs: &ProjectDirs) -> Result<WorkerGuard> {
 
 fn compute_scaled_dimensions(
     image: &RenderImage,
+    effective_pixel_width: f32,
+    effective_pixel_height: f32,
     available_cols: u32,
     available_rows: u32,
     total_cols: u32,
@@ -346,13 +361,21 @@ fn compute_scaled_dimensions(
         return (draw_cols, draw_rows);
     }
 
-    if pixel_width > 0 && pixel_height > 0 && total_cols > 0 && total_rows > 0 {
+    if pixel_width > 0
+        && pixel_height > 0
+        && total_cols > 0
+        && total_rows > 0
+        && effective_pixel_width.is_finite()
+        && effective_pixel_height.is_finite()
+        && effective_pixel_width > 0.0
+        && effective_pixel_height > 0.0
+    {
         let cell_width = pixel_width as f32 / total_cols as f32;
         let cell_height = pixel_height as f32 / total_rows as f32;
 
         if cell_width > 0.0 && cell_height > 0.0 {
-            let mut cols = (image.width as f32 / cell_width).round().max(1.0);
-            let mut rows = (image.height as f32 / cell_height).round().max(1.0);
+            let mut cols = (effective_pixel_width / cell_width).round().max(1.0);
+            let mut rows = (effective_pixel_height / cell_height).round().max(1.0);
 
             if cols > available_cols as f32 {
                 cols = available_cols as f32;
@@ -365,7 +388,11 @@ fn compute_scaled_dimensions(
             draw_rows = rows as u32;
         }
     } else {
-        let ratio = image.width as f32 / image.height as f32;
+        let ratio = if effective_pixel_height > 0.0 {
+            effective_pixel_width / effective_pixel_height
+        } else {
+            image.width as f32 / image.height as f32
+        };
         if ratio.is_finite() && ratio > 0.0 {
             let mut cols = available_cols as f32;
             let mut rows = (cols / ratio).round().max(1.0);
