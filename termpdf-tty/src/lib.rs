@@ -86,7 +86,7 @@ impl<W: Write> KittyRenderer<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEventKind, KeyEventState};
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 
     #[test]
     fn kitty_draw_emits_protocol() {
@@ -105,9 +105,13 @@ mod tests {
     }
 
     fn key_event(code: KeyCode) -> Event {
+        key_event_with_modifiers(code, KeyModifiers::NONE)
+    }
+
+    fn key_event_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         })
@@ -205,6 +209,70 @@ mod tests {
         }
         assert!(mapper.pending_input().is_none());
     }
+
+    #[test]
+    fn event_mapper_maps_ctrl_arrows_to_viewport_adjustment() {
+        let mut mapper = EventMapper::new();
+
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
+        )) {
+            UiEvent::Command(Command::AdjustViewport { delta_x, delta_y }) => {
+                assert!((delta_x - EventMapper::PAN_STEP).abs() < f32::EPSILON);
+                assert_eq!(delta_y, 0.0);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(KeyCode::Up, KeyModifiers::CONTROL)) {
+            UiEvent::Command(Command::AdjustViewport { delta_x, delta_y }) => {
+                assert_eq!(delta_x, 0.0);
+                assert!((delta_y + EventMapper::PAN_STEP).abs() < f32::EPSILON);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_maps_letter_shortcuts_to_viewport_adjustment() {
+        let mut mapper = EventMapper::new();
+
+        match mapper.map_event(key_event(KeyCode::Char('h'))) {
+            UiEvent::Command(Command::AdjustViewport { delta_x, delta_y }) => {
+                assert!((delta_x + EventMapper::PAN_STEP).abs() < f32::EPSILON);
+                assert_eq!(delta_y, 0.0);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('J'),
+            KeyModifiers::SHIFT,
+        )) {
+            UiEvent::Command(Command::AdjustViewport { delta_x, delta_y }) => {
+                assert_eq!(delta_x, 0.0);
+                assert!((delta_y - EventMapper::PAN_STEP).abs() < f32::EPSILON);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_numeric_prefix_scales_pan_distance() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('3'))),
+            UiEvent::None
+        ));
+        match mapper.map_event(key_event(KeyCode::Char('l'))) {
+            UiEvent::Command(Command::AdjustViewport { delta_x, delta_y }) => {
+                assert!((delta_x - 3.0 * EventMapper::PAN_STEP).abs() < f32::EPSILON);
+                assert_eq!(delta_y, 0.0);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +290,8 @@ pub struct EventMapper {
 }
 
 impl EventMapper {
+    const PAN_STEP: f32 = 0.1;
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -257,6 +327,24 @@ impl EventMapper {
                     }
                     UiEvent::None
                 }
+                (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.pan(-Self::PAN_STEP, 0.0)
+                }
+                (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.pan(Self::PAN_STEP, 0.0)
+                }
+                (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.pan(0.0, -Self::PAN_STEP)
+                }
+                (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.pan(0.0, Self::PAN_STEP)
+                }
+                (KeyCode::Char('H'), KeyModifiers::SHIFT)
+                | (KeyCode::Char('h'), KeyModifiers::NONE) => self.pan(-Self::PAN_STEP, 0.0),
+                (KeyCode::Char('L'), KeyModifiers::SHIFT)
+                | (KeyCode::Char('l'), KeyModifiers::NONE) => self.pan(Self::PAN_STEP, 0.0),
+                (KeyCode::Char('K'), KeyModifiers::SHIFT) => self.pan(0.0, -Self::PAN_STEP),
+                (KeyCode::Char('J'), KeyModifiers::SHIFT) => self.pan(0.0, Self::PAN_STEP),
                 (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
                     let count = self.take_count();
                     UiEvent::Command(Command::NextPage { count })
@@ -325,13 +413,17 @@ impl EventMapper {
     fn push_char(&mut self, char: char) {
         self.char_stack.push(char);
     }
-    fn take_char_stack(&mut self) -> String {
-        let res = self.char_stack.clone();
-        self.char_stack = String::new();
-        res
-    }
     fn reset_char_stack(&mut self) {
         self.char_stack = String::new();
+    }
+
+    fn pan(&mut self, delta_x: f32, delta_y: f32) -> UiEvent {
+        let multiplier = self.take_count() as f32;
+        self.reset_char_stack();
+        UiEvent::Command(Command::AdjustViewport {
+            delta_x: delta_x * multiplier,
+            delta_y: delta_y * multiplier,
+        })
     }
 
     pub fn pending_input(&self) -> Option<String> {

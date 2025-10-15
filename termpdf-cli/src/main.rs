@@ -10,7 +10,7 @@ use crossterm::cursor;
 use crossterm::event;
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
-use termpdf_core::{Command, FileStateStore, RenderImage, Session, StateStore};
+use termpdf_core::{Command, DocumentInstance, FileStateStore, RenderImage, Session, StateStore};
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{write_status_line, DrawParams, EventMapper, KittyRenderer, UiEvent};
 use tracing::warn;
@@ -137,6 +137,7 @@ fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
                     | Command::NextPage { .. }
                     | Command::PrevPage { .. }
                     | Command::ScaleBy { .. }
+                    | Command::AdjustViewport { .. }
                     | Command::GotoMark { .. }
                     | Command::ToggleDarkMode
                     | Command::SwitchDocument { .. }
@@ -175,9 +176,24 @@ fn redraw(
         let mut render_scale = base_scale;
         let mut image = doc.render_with_scale(base_scale)?;
 
-        if pixel_width > 0 && pixel_height > 0 && image.width > 0 && image.height > 0 {
-            let cell_width = pixel_width as f32 / total_cols as f32;
-            let cell_height = pixel_height as f32 / total_rows as f32;
+        let cell_width = if total_cols > 0 {
+            pixel_width as f32 / total_cols as f32
+        } else {
+            0.0
+        };
+        let cell_height = if total_rows > 0 {
+            pixel_height as f32 / total_rows as f32
+        } else {
+            0.0
+        };
+
+        if cell_width > 0.0
+            && cell_height > 0.0
+            && image.width > 0
+            && image.height > 0
+            && pixel_width > 0
+            && pixel_height > 0
+        {
             let desired_pixel_width = cell_width * available_cols as f32;
             let desired_pixel_height = cell_height * available_rows as f32;
             if desired_pixel_width > 0.0 && desired_pixel_height > 0.0 {
@@ -192,8 +208,38 @@ fn redraw(
             }
         }
 
+        let zoom_scale = doc.state.scale;
+        let mut display_image = image;
+
+        if zoom_scale > 1.0 {
+            let crop_ratio = (1.0 / zoom_scale).min(1.0);
+            if crop_ratio.is_finite() && crop_ratio > 0.0 {
+                let crop_width = (display_image.width as f32 * crop_ratio)
+                    .round()
+                    .clamp(1.0, display_image.width as f32) as u32;
+                let crop_height = (display_image.height as f32 * crop_ratio)
+                    .round()
+                    .clamp(1.0, display_image.height as f32)
+                    as u32;
+                if crop_width < display_image.width || crop_height < display_image.height {
+                    let viewport = doc.state.viewport;
+                    let offset_x =
+                        compute_viewport_origin(display_image.width, crop_width, viewport.x);
+                    let offset_y =
+                        compute_viewport_origin(display_image.height, crop_height, viewport.y);
+                    display_image = crop_render_image(
+                        &display_image,
+                        offset_x,
+                        offset_y,
+                        crop_width,
+                        crop_height,
+                    );
+                }
+            }
+        }
+
         let (draw_cols, draw_rows) = compute_scaled_dimensions(
-            &image,
+            &display_image,
             available_cols,
             available_rows,
             total_cols,
@@ -213,17 +259,8 @@ fn redraw(
             )?;
         }
 
-        renderer.draw(&image, DrawParams::clamped(draw_cols, draw_rows))?;
-        let info = &doc.info;
-        let status_text = format!(
-            "{} — page {}/{}",
-            info.path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unknown>"),
-            doc.state.current_page + 1,
-            info.page_count
-        );
+        renderer.draw(&display_image, DrawParams::clamped(draw_cols, draw_rows))?;
+        let status_text = format_document_status(doc);
         if let Some(status) = combine_status(Some(status_text), pending_input) {
             draw_status_line(renderer, &status)?;
         }
@@ -240,18 +277,7 @@ fn redraw(
 }
 
 fn document_status(session: &Session) -> Option<String> {
-    session.active().map(|doc| {
-        format!(
-            "{} — page {}/{}",
-            doc.info
-                .path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unknown>"),
-            doc.state.current_page + 1,
-            doc.info.page_count
-        )
-    })
+    session.active().map(format_document_status)
 }
 
 fn combine_status(base: Option<String>, pending_input: Option<&str>) -> Option<String> {
@@ -323,23 +349,18 @@ fn compute_scaled_dimensions(
     if pixel_width > 0 && pixel_height > 0 && total_cols > 0 && total_rows > 0 {
         let cell_width = pixel_width as f32 / total_cols as f32;
         let cell_height = pixel_height as f32 / total_rows as f32;
-        let avail_pixel_width = cell_width * available_cols as f32;
-        let avail_pixel_height = cell_height * available_rows as f32;
 
-        if avail_pixel_width > 0.0 && avail_pixel_height > 0.0 {
-            let scale_w = avail_pixel_width / image.width as f32;
-            let scale_h = avail_pixel_height / image.height as f32;
-            let scale = scale_w.min(scale_h).max(0.01);
-            let scaled_pixel_width = image.width as f32 * scale;
-            let scaled_pixel_height = image.height as f32 * scale;
-            let mut cols = (scaled_pixel_width / cell_width).round().max(1.0);
-            let mut rows = (scaled_pixel_height / cell_height).round().max(1.0);
+        if cell_width > 0.0 && cell_height > 0.0 {
+            let mut cols = (image.width as f32 / cell_width).round().max(1.0);
+            let mut rows = (image.height as f32 / cell_height).round().max(1.0);
+
             if cols > available_cols as f32 {
                 cols = available_cols as f32;
             }
             if rows > available_rows as f32 {
                 rows = available_rows as f32;
             }
+
             draw_cols = cols as u32;
             draw_rows = rows as u32;
         }
@@ -363,4 +384,77 @@ fn compute_scaled_dimensions(
     draw_rows = draw_rows.max(1).min(available_rows);
 
     (draw_cols, draw_rows)
+}
+
+fn compute_viewport_origin(total: u32, viewport: u32, fraction: f32) -> u32 {
+    if viewport >= total || total == 0 {
+        return 0;
+    }
+    let max_offset = total - viewport;
+    if max_offset == 0 {
+        return 0;
+    }
+    let clamped = fraction.clamp(0.0, 1.0);
+    let raw = (max_offset as f32 * clamped).round();
+    raw.max(0.0).min(max_offset as f32) as u32
+}
+
+fn crop_render_image(
+    image: &RenderImage,
+    origin_x: u32,
+    origin_y: u32,
+    width: u32,
+    height: u32,
+) -> RenderImage {
+    if image.width == 0 || image.height == 0 {
+        return RenderImage {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    }
+
+    let width = width.min(image.width).max(1);
+    let height = height.min(image.height).max(1);
+    let max_origin_x = image.width.saturating_sub(width);
+    let max_origin_y = image.height.saturating_sub(height);
+    let origin_x = origin_x.min(max_origin_x);
+    let origin_y = origin_y.min(max_origin_y);
+
+    let stride = image.width as usize * 4;
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+
+    for row in 0..height {
+        let src_y = origin_y + row;
+        let start = src_y as usize * stride + origin_x as usize * 4;
+        let end = start + width as usize * 4;
+        pixels.extend_from_slice(&image.pixels[start..end]);
+    }
+
+    RenderImage {
+        width,
+        height,
+        pixels,
+    }
+}
+
+fn format_document_status(doc: &DocumentInstance) -> String {
+    let zoom_percent = doc.state.scale * 100.0;
+    let zoom_display = if zoom_percent.is_finite() {
+        format!("{:.0}%", zoom_percent)
+    } else {
+        "—".to_string()
+    };
+
+    format!(
+        "{} — page {}/{} — {}",
+        doc.info
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("<unknown>"),
+        doc.state.current_page + 1,
+        doc.info.page_count,
+        zoom_display
+    )
 }

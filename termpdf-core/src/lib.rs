@@ -39,6 +39,51 @@ pub struct DocumentMetadata {
     pub keywords: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ViewportOffset {
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+}
+
+impl Default for ViewportOffset {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0 }
+    }
+}
+
+impl ViewportOffset {
+    pub fn reset(&mut self) {
+        self.x = 0.0;
+        self.y = 0.0;
+    }
+
+    pub fn adjust(&mut self, delta_x: f32, delta_y: f32) -> bool {
+        let mut changed = false;
+        if delta_x.abs() > f32::EPSILON {
+            let next = (self.x + delta_x).clamp(0.0, 1.0);
+            if (next - self.x).abs() > f32::EPSILON {
+                self.x = next;
+                changed = true;
+            }
+        }
+        if delta_y.abs() > f32::EPSILON {
+            let next = (self.y + delta_y).clamp(0.0, 1.0);
+            if (next - self.y).abs() > f32::EPSILON {
+                self.y = next;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn clamp(&mut self) {
+        self.x = self.x.clamp(0.0, 1.0);
+        self.y = self.y.clamp(0.0, 1.0);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentInfo {
     pub id: DocumentId,
@@ -77,6 +122,8 @@ pub struct PersistedDocumentState {
     pub scale: f32,
     pub dark_mode: bool,
     pub marks: HashMap<char, usize>,
+    #[serde(default)]
+    pub viewport: ViewportOffset,
 }
 
 impl Default for PersistedDocumentState {
@@ -86,6 +133,7 @@ impl Default for PersistedDocumentState {
             scale: 1.0,
             dark_mode: false,
             marks: HashMap::new(),
+            viewport: ViewportOffset::default(),
         }
     }
 }
@@ -249,6 +297,7 @@ pub enum Command {
     PrevPage { count: usize },
     GotoPage { page: usize },
     ScaleBy { factor: f32 },
+    AdjustViewport { delta_x: f32, delta_y: f32 },
     PutMark { key: char },
     GotoMark { key: char },
     ToggleDarkMode,
@@ -399,6 +448,7 @@ impl Session {
                     let next = page.min(doc.info.page_count.saturating_sub(1));
                     if next != doc.state.current_page {
                         doc.state.current_page = next;
+                        doc.state.viewport.reset();
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -442,6 +492,7 @@ impl Session {
                         (doc.state.current_page + count).min(doc.info.page_count.saturating_sub(1));
                     if next != doc.state.current_page {
                         doc.state.current_page = next;
+                        doc.state.viewport.reset();
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -453,6 +504,7 @@ impl Session {
                     let next = doc.state.current_page.saturating_sub(count);
                     if next != doc.state.current_page {
                         doc.state.current_page = next;
+                        doc.state.viewport.reset();
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -464,6 +516,7 @@ impl Session {
                     let next = page.min(doc.info.page_count.saturating_sub(1));
                     if next != doc.state.current_page {
                         doc.state.current_page = next;
+                        doc.state.viewport.reset();
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -475,6 +528,20 @@ impl Session {
                     let scale = (doc.state.scale * factor).clamp(0.25, 4.0);
                     if (doc.state.scale - scale).abs() > f32::EPSILON {
                         doc.state.scale = scale;
+                        if scale <= 1.0 + f32::EPSILON {
+                            doc.state.viewport.reset();
+                        } else {
+                            doc.state.viewport.clamp();
+                        }
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::AdjustViewport { delta_x, delta_y } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.state.viewport.adjust(delta_x, delta_y) {
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
