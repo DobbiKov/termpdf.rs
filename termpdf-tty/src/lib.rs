@@ -179,6 +179,7 @@ pub enum UiEvent {
 #[derive(Debug, Default)]
 pub struct EventMapper {
     pending_count: Option<usize>,
+    char_stack: String,
 }
 
 impl EventMapper {
@@ -194,6 +195,26 @@ impl EventMapper {
                 (KeyCode::Char(c), KeyModifiers::NONE) if c.is_ascii_digit() => {
                     if let Some(digit) = c.to_digit(10) {
                         self.push_digit(digit as usize);
+                    }
+                    UiEvent::None
+                }
+                (KeyCode::Char(c), _) if (self.char_stack.as_str() == "m") => {
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::PutMark { key: c })
+                }
+                (KeyCode::Char(c), _) if (self.char_stack.as_str() == "\'") => {
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::GotoMark { key: c })
+                }
+                (KeyCode::Char('m'), _) => {
+                    if self.char_stack.is_empty() {
+                        self.push_char('m');
+                    }
+                    UiEvent::None
+                }
+                (KeyCode::Char('\''), _) => {
+                    if self.char_stack.is_empty() {
+                        self.push_char('\'');
                     }
                     UiEvent::None
                 }
@@ -253,6 +274,18 @@ impl EventMapper {
 
     fn reset_count(&mut self) {
         self.pending_count = None;
+    }
+
+    fn push_char(&mut self, char: char) {
+        self.char_stack.push(char);
+    }
+    fn take_char_stack(&mut self) -> String {
+        let res = self.char_stack.clone();
+        self.char_stack = String::new();
+        res
+    }
+    fn reset_char_stack(&mut self) {
+        self.char_stack = String::new();
     }
 }
 

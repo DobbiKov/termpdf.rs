@@ -56,6 +56,7 @@ pub struct PersistedDocumentState {
     pub current_page: usize,
     pub scale: f32,
     pub dark_mode: bool,
+    pub marks: HashMap<char, usize>,
 }
 
 impl Default for PersistedDocumentState {
@@ -64,6 +65,7 @@ impl Default for PersistedDocumentState {
             current_page: 0,
             scale: 1.0,
             dark_mode: false,
+            marks: HashMap::new(),
         }
     }
 }
@@ -100,6 +102,12 @@ impl DocumentInstance {
             self.state.dark_mode,
             self.state.current_page,
         )
+    }
+    pub fn add_mark(&mut self, mark: char, page: usize) {
+        self.state.marks.insert(mark, page);
+    }
+    pub fn get_page_from_mark(&self, mark: char) -> Option<usize> {
+        self.state.marks.get(&mark).map(|v| *v)
     }
 
     pub fn prefetch_neighbors(&self, range: usize, scale: f32) -> Result<()> {
@@ -221,6 +229,8 @@ pub enum Command {
     PrevPage { count: usize },
     GotoPage { page: usize },
     ScaleBy { factor: f32 },
+    PutMark { key: char },
+    GotoMark { key: char },
     ToggleDarkMode,
     SwitchDocument { index: usize },
     CloseDocument { index: usize },
@@ -348,6 +358,27 @@ impl Session {
 
     pub fn apply(&mut self, command: Command) -> Result<()> {
         match command {
+            Command::PutMark { key } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    let curr_page = doc.state.current_page;
+                    doc.add_mark(key, curr_page);
+                }
+            }
+            Command::GotoMark { key } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    let curr_page = doc.state.current_page;
+                    let page = doc.get_page_from_mark(key).unwrap_or(1);
+                    // TODO: return
+                    // error
+                    let next = page.min(doc.info.page_count.saturating_sub(1));
+                    if next != doc.state.current_page {
+                        doc.state.current_page = next;
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
             Command::OpenDocument { path: _ } => {
                 anyhow::bail!("use `open_with` to open documents asynchronously");
             }
