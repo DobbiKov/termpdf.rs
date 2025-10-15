@@ -42,6 +42,7 @@ Flags:
 - `g`: jump to the first page.
 - `G` / `End`: jump to the last page.
 - `+` / `-`: zoom in/out (clamped between 0.25x and 4x; auto-fit may request a higher scale when there is space).
+- `=`: reset zoom to 100%.
 - `Ctrl` + arrow keys: pan the current page when zoomed (horizontal panning also works with `h`/`l`, vertical with `Shift+J`/`Shift+K`).
 - `d`: toggle dark-mode inversion.
 - `m<char>`: record a mark for the active page.

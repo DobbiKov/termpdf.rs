@@ -137,6 +137,7 @@ fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
                     | Command::NextPage { .. }
                     | Command::PrevPage { .. }
                     | Command::ScaleBy { .. }
+                    | Command::ResetScale
                     | Command::AdjustViewport { .. }
                     | Command::GotoMark { .. }
                     | Command::ToggleDarkMode

@@ -235,6 +235,15 @@ mod tests {
     }
 
     #[test]
+    fn event_mapper_maps_equal_to_reset_scale() {
+        let mut mapper = EventMapper::new();
+        match mapper.map_event(key_event(KeyCode::Char('='))) {
+            UiEvent::Command(Command::ResetScale) => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
     fn event_mapper_maps_letter_shortcuts_to_viewport_adjustment() {
         let mut mapper = EventMapper::new();
 
@@ -326,6 +335,11 @@ impl EventMapper {
                         self.push_char('\'');
                     }
                     UiEvent::None
+                }
+                (KeyCode::Char('='), _) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::ResetScale)
                 }
                 (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                     self.pan(-Self::PAN_STEP, 0.0)

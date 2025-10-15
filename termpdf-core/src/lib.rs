@@ -297,6 +297,7 @@ pub enum Command {
     PrevPage { count: usize },
     GotoPage { page: usize },
     ScaleBy { factor: f32 },
+    ResetScale,
     AdjustViewport { delta_x: f32, delta_y: f32 },
     PutMark { key: char },
     GotoMark { key: char },
@@ -533,6 +534,20 @@ impl Session {
                         } else {
                             doc.state.viewport.clamp();
                         }
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::ResetScale => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    let prev_scale = doc.state.scale;
+                    let viewport_changed = (doc.state.viewport.x.abs() > f32::EPSILON)
+                        || (doc.state.viewport.y.abs() > f32::EPSILON);
+                    doc.state.scale = 1.0;
+                    doc.state.viewport.reset();
+                    if (prev_scale - 1.0).abs() > f32::EPSILON || viewport_changed {
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
