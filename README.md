@@ -1,91 +1,68 @@
 # `termpdf` (Rust)
 
-A kitty-native PDF (and future EPUB/HTML) viewer written in Rust. This
-project is a ground-up rewrite of the original Python implementation,
-focused on a modular architecture, clean dependency management, and
-better long-term maintainability.
+Kitty-native PDF viewer rewrite in Rust. The workspace currently ships a single CLI (`termpdf-cli`) backed by `pdfium-render` and a Kitty-specific renderer.
 
-## Features (MVP)
-- Render PDF pages inside Kitty using the terminal graphics protocol.
-- Vim-style key bindings for navigation (`j/k`, `g/G`, `+/-`, `d` for dark mode).
-- Multiple document buffers with per-document session persistence
-  (last page, scale, dark-mode flag).
-- JSON-backed state store under the standard XDG data directory.
-- Graceful CLI (`termpdf-cli`) with argument parsing and logging.
+## Current Capabilities
+- Render PDF pages inside Kitty via its graphics protocol; the PDF backend is the only backend implemented today.
+- Vim-flavoured navigation (`j/k`, `g/G`, `+/-`, `d`, `q`) with numeric prefixes (`12j`) and mark support (`m<char>` to set, `'<char>` to jump).
+- Automatic page scaling that fits the current terminal window plus a dark-mode inversion toggle.
+- Prefetch and cache of neighbouring pages to keep navigation snappy.
+- Accept multiple files on the CLI; the last one opened becomes the active document in the viewer.
 
-## Roadmap
-The rewrite mirrors the scope of the legacy project. Items checked are
-implemented in Rust; unchecked items are tracked in the original
-backlog and slated for future iterations.
-
-- [x] PDF rendering via `pdfium-render`.
-- [x] Kitty graphics protocol renderer.
-- [x] Session persistence.
-- [x] Vim-style navigation basics.
-- [ ] EPUB/HTML/CBZ backends.
-- [ ] Annotations, outlines, and remote control RPC.
-- [ ] Configurable key maps and rich config file parser.
+## Gaps & Roadmap
+- No interactive document switching UI, annotations, outlines, or remote-control RPC.
+- EPUB/HTML/CBZ backends and configurable key mappings remain future work.
 
 ## Requirements
-- Rust toolchain (1.70+).
-- [Kitty](https://sw.kovidgoyal.net/kitty/) terminal emulator.
-- A Pdfium binary compatible with the host platform. You can:
-  1. Place `libpdfium` (macOS/Linux) or `pdfium.dll` (Windows) alongside
-     the executable; **or**
-  2. Set `PDFIUM_LIBRARY_PATH` to point at the shared library; **or**
-  3. Install a system-provided Pdfium (Homebrew: `brew install pdfium`).
+- Rust toolchain (1.70+ recommended).
+- [`kitty`](https://sw.kovidgoyal.net/kitty/) terminal emulator; other terminals do not understand the graphics protocol used here.
+- A Pdfium dynamic library. During `cargo build` the `termpdf-render` build script will try to download a matching binary from `pdfium-binaries`. To supply your own instead:
+  - Place the library next to the executable and expose it via `PDFIUM_LIBRARY_PATH`, or
+  - Pre-set `PDFIUM_DYNAMIC_LIB_PATH` / `PDFIUM_STATIC_LIB_PATH`, or
+  - Set `TERMPDF_PDFIUM_ARCHIVE_PATH` or `TERMPDF_PDFIUM_SKIP_DOWNLOAD` to control the build step.
 
-If Pdfium cannot be located, the CLI will error on startup with guidance.
+If Pdfium cannot be found at runtime the CLI exits with a descriptive error.
 
 ## Building
 ```bash
 cargo build --workspace
 ```
-This produces the CLI binary at `target/debug/termpdf-cli`.
+The CLI binary lands at `target/debug/termpdf-cli`.
 
 ## Running
 ```bash
-cargo run --bin termpdf-cli -- <file.pdf>
+cargo run --bin termpdf-cli -- [-p <page>] <file.pdf> [<more.pdf> ...]
 ```
-Optional flags:
-- `-p, --page <N>`: open documents at zero-based page `N`.
+Flags:
+- `-p`, `--page <N>`: start documents at zero-based page `N`.
 
-Within the viewer:
-- `j` / `↓`: next page.
+### Viewer Controls
+- `j` / `↓`: next page (`12j` works for counts).
 - `k` / `↑`: previous page.
-- `g`: go to beginning.
-- `G` / `End`: go to last page.
-- `+` / `-`: zoom in/out (relative scaling).
-- `d`: toggle dark mode inversion.
+- `g`: jump to the first page.
+- `G` / `End`: jump to the last page.
+- `+` / `-`: zoom in/out (clamped between 0.25x and 4x; auto-fit may request a higher scale when there is space).
+- `d`: toggle dark-mode inversion.
+- `m<char>`: record a mark for the active page.
+- `'<char>`: jump to a recorded mark.
 - `q`: quit.
 
-## Configuration & State
-Configuration is currently hard-coded, but session state is stored per
-file under:
-```
-$XDG_DATA_HOME/termpdf/state/<document-id>.json
-```
-On macOS this resolves to `~/Library/Application Support/termpdf/state/`.
+A status line appears at the bottom showing the filename, current page, and any partially entered numeric prefix or command.
 
-## Tests
+## Session Data
+State files are written under the platform data directory reported by `directories::ProjectDirs` (for example `~/.local/share/termpdf/state/` on Linux or `~/Library/Application Support/net.termpdf.termpdf/state/` on macOS). Document IDs are derived from the document's canonical path, so reopening the same file restores the last page, scale, dark-mode flag, and marks. Opening the file through a different path (e.g. a new symlink) generates a fresh session.
+
+## Project Layout
+- `termpdf-core`: document/session state machine, caching, and persistence helpers.
+- `termpdf-render`: Pdfium-backed renderer and the build script that fetches Pdfium binaries when needed.
+- `termpdf-tty`: Kitty protocol renderer, key/event mapper, and status-line helpers.
+- `termpdf-cli`: clap-based CLI wiring the pieces together.
+
+## Development
 ```bash
 cargo test
 ```
-All unit tests are isolated from Pdfium by using fake backends in the
-core crate. Rendering integration requires a Pdfium runtime.
-
-## Project Layout
-- `termpdf-core`: document/session state machine, storage interfaces.
-- `termpdf-render`: Pdfium-backed rendering plus trait implementations.
-- `termpdf-tty`: Kitty protocol renderer, key mapping helpers.
-- `termpdf-cli`: end-user binary wiring everything together.
-
-## Development Notes
-- Enable `RUST_LOG=debug` to see tracing output.
-- The Pdfium backend opens documents on demand; repeated renders reuse
-  an in-memory cache for the last page.
-- Future work: feature flags for alternate backends, RPC integration,
-  richer configuration, and golden-image tests.
+Tests cover the session state machine, key-event mapper, and renderer protocol helpers. Rendering integration still requires a Pdfium runtime. Enable `RUST_LOG=debug` to surface tracing output during manual runs.
 
 ## License
-MIT (same as the original project).
+MIT

@@ -5,12 +5,32 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Error, Result};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument};
+use tracing::instrument;
 use uuid::Uuid;
 
 pub type DocumentId = Uuid;
+
+static DOCUMENT_NAMESPACE: Lazy<Uuid> = Lazy::new(|| {
+    Uuid::parse_str("7b2c58f1-99c6-5a5c-a6ea-50f9e7f1cc20").expect("valid namespace UUID")
+});
+
+pub fn document_id_for_path(path: &Path) -> DocumentId {
+    let resolved = path
+        .canonicalize()
+        .or_else(|_| {
+            if path.is_absolute() {
+                Ok(path.to_path_buf())
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(path))
+            }
+        })
+        .unwrap_or_else(|_| path.to_path_buf());
+    let rendered = resolved.to_string_lossy();
+    Uuid::new_v5(&*DOCUMENT_NAMESPACE, rendered.as_bytes())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DocumentMetadata {
@@ -362,17 +382,14 @@ impl Session {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     let curr_page = doc.state.current_page;
                     doc.add_mark(key, curr_page);
-                    let marks_snapshot = doc.state.marks.clone();
                 }
             }
             Command::GotoMark { key } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
-                    let curr_page = doc.state.current_page;
                     let (target_page, resolved_page) = match doc.get_page_from_mark(key) {
                         Some(page) => (Some(page), page),
                         None => (None, 10),
                     };
-                    let marks_snapshot = doc.state.marks.clone();
                     if target_page.is_none() {
                         return Ok(());
                         // TODO: return
@@ -518,6 +535,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use tempfile::tempdir;
+
     struct FakeBackend {
         info: DocumentInfo,
     }
@@ -543,7 +562,7 @@ mod tests {
     impl DocumentProvider for FakeProvider {
         async fn open(&self, path: &Path) -> Result<Arc<dyn DocumentBackend>> {
             let info = DocumentInfo {
-                id: Uuid::new_v4(),
+                id: document_id_for_path(path),
                 path: path.to_path_buf(),
                 page_count: 100,
                 metadata: DocumentMetadata::default(),
@@ -575,5 +594,47 @@ mod tests {
         let info = session.active().unwrap().info.clone();
         let stored = store.load(&info).unwrap().unwrap();
         assert_eq!(stored.current_page, 99);
+    }
+
+    #[test]
+    fn document_id_is_stable_for_same_path() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("sample.pdf");
+        std::fs::write(&file_path, b"dummy").unwrap();
+
+        let first = document_id_for_path(&file_path);
+        let second = document_id_for_path(&file_path);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn file_state_store_restores_state_with_stable_id() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("sample.pdf");
+        std::fs::write(&file_path, b"dummy").unwrap();
+
+        let info = DocumentInfo {
+            id: document_id_for_path(&file_path),
+            path: file_path.clone(),
+            page_count: 3,
+            metadata: DocumentMetadata::default(),
+        };
+
+        let store = FileStateStore::new(dir.path().join("state")).unwrap();
+
+        let mut state = PersistedDocumentState::default();
+        state.current_page = 2;
+        state.scale = 1.5;
+        state.dark_mode = true;
+        state.marks.insert('a', 1);
+
+        store.save(&info, &state).unwrap();
+
+        let restored = store.load(&info).unwrap().unwrap();
+        assert_eq!(restored.current_page, 2);
+        assert!(restored.dark_mode);
+        assert_eq!(restored.scale, 1.5);
+        assert_eq!(restored.marks.get(&'a'), Some(&1));
     }
 }

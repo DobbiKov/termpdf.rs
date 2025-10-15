@@ -41,5 +41,5 @@ assert_cmd = "2.0"
 expectrl = "0.7"
 insta = { version = "1.39", features = ["redactions"] }
 serde_bytes = "0.11"
-uuid = { version = "1.6", features = ["v4"] }
+uuid = { version = "1.6", features = ["v4", "v5"] }
 pdfium-render = { version = "0.8.35" }

@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use pdfium_render::prelude::*;
 use termpdf_core::{
-    DocumentBackend, DocumentInfo, DocumentMetadata, DocumentProvider, RenderImage, RenderRequest,
+    document_id_for_path, DocumentBackend, DocumentInfo, DocumentMetadata, DocumentProvider,
+    RenderImage, RenderRequest,
 };
 use tracing::{instrument, warn};
-use uuid::Uuid;
 
 pub struct PdfiumRenderFactory {
     pdfium: Arc<Pdfium>,
@@ -158,7 +158,7 @@ fn build_document_info(pdfium: &Pdfium, path: &Path) -> Result<DocumentInfo> {
         .unwrap_or_else(Vec::new);
 
     Ok(DocumentInfo {
-        id: Uuid::new_v4(),
+        id: document_id_for_path(path),
         path: path.to_path_buf(),
         page_count,
         metadata: DocumentMetadata {
