@@ -340,9 +340,8 @@ fn handle_event(
                     session.apply(Command::GotoPage {
                         page: entry.page_index,
                     })?;
-                    if let Some(doc) = session.active() {
-                        toc.update_selection_for_page(doc.state.current_page);
-                    }
+                    overlay.deactivate();
+                    mapper.set_mode(InputMode::Normal);
                     return Ok(LoopAction::ContinueRedraw);
                 }
             }
