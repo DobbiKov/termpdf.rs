@@ -373,9 +373,12 @@ impl Session {
                         None => (None, 10),
                     };
                     let marks_snapshot = doc.state.marks.clone();
+                    if target_page.is_none() {
+                        return Ok(());
+                        // TODO: return
+                        // error
+                    }
                     let page = resolved_page;
-                    // TODO: return
-                    // error
                     let next = page.min(doc.info.page_count.saturating_sub(1));
                     if next != doc.state.current_page {
                         doc.state.current_page = next;
