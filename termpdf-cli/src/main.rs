@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
 
     loop {
         if dirty {
+            let pending = event_mapper.pending_input();
             if needs_initial_clear {
                 {
                     let mut writer = renderer.writer();
@@ -90,13 +91,17 @@ async fn main() -> Result<()> {
                 }
                 needs_initial_clear = false;
             }
-            redraw(&mut renderer, &session)?;
+            redraw(&mut renderer, &session, pending.as_deref())?;
             dirty = false;
         }
 
         if event::poll(Duration::from_millis(100))? {
             let ev = event::read()?;
             let ui_event = event_mapper.map_event(ev);
+            let pending = event_mapper.pending_input();
+            if let Some(status) = combine_status(document_status(&session), pending.as_deref()) {
+                draw_status_line(&mut renderer, &status)?;
+            }
             match handle_event(ui_event, &mut session)? {
                 LoopAction::ContinueRedraw => dirty = true,
                 LoopAction::Continue => {}
@@ -144,7 +149,11 @@ fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
     }
 }
 
-fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result<()> {
+fn redraw(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    session: &Session,
+    pending_input: Option<&str>,
+) -> Result<()> {
     if let Some(doc) = session.active() {
         let window = terminal::window_size()?;
         let total_cols = u32::from(window.columns).max(1);
@@ -202,7 +211,7 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
 
         renderer.draw(&image, DrawParams::clamped(draw_cols, draw_rows))?;
         let info = &doc.info;
-        let status = format!(
+        let status_text = format!(
             "{} — page {}/{}",
             info.path
                 .file_name()
@@ -211,15 +220,8 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
             doc.state.current_page + 1,
             info.page_count
         );
-        let status_row = total_rows.saturating_sub(1);
-        {
-            let mut writer = renderer.writer();
-            crossterm::execute!(
-                &mut writer,
-                cursor::MoveTo(0, status_row as u16),
-                Clear(ClearType::CurrentLine)
-            )?;
-            write_status_line(&mut writer, &status)?;
+        if let Some(status) = combine_status(Some(status_text), pending_input) {
+            draw_status_line(renderer, &status)?;
         }
 
         if let Err(err) = doc.prefetch_neighbors(2, render_scale) {
@@ -230,6 +232,48 @@ fn redraw(renderer: &mut KittyRenderer<io::Stdout>, session: &Session) -> Result
             );
         }
     }
+    Ok(())
+}
+
+fn document_status(session: &Session) -> Option<String> {
+    session.active().map(|doc| {
+        format!(
+            "{} — page {}/{}",
+            doc.info
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unknown>"),
+            doc.state.current_page + 1,
+            doc.info.page_count
+        )
+    })
+}
+
+fn combine_status(base: Option<String>, pending_input: Option<&str>) -> Option<String> {
+    match (base, pending_input.filter(|s| !s.is_empty())) {
+        (Some(mut base), Some(pending)) => {
+            base.push_str(" | ");
+            base.push_str(pending);
+            Some(base)
+        }
+        (Some(base), None) => Some(base),
+        (None, Some(pending)) => Some(pending.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn draw_status_line(renderer: &mut KittyRenderer<io::Stdout>, status: &str) -> Result<()> {
+    let window = terminal::window_size()?;
+    let total_rows = u32::from(window.rows).max(1);
+    let status_row = total_rows.saturating_sub(1);
+    let mut writer = renderer.writer();
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(0, status_row as u16),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write_status_line(&mut writer, status)?;
     Ok(())
 }
 

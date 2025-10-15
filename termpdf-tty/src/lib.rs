@@ -167,6 +167,44 @@ mod tests {
             other => panic!("unexpected event: {:?}", other),
         }
     }
+
+    #[test]
+    fn event_mapper_pending_input_shows_digits_until_consumed() {
+        let mut mapper = EventMapper::new();
+        assert!(mapper.pending_input().is_none());
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('1'))),
+            UiEvent::None
+        ));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('2'))),
+            UiEvent::None
+        ));
+        assert_eq!(mapper.pending_input().as_deref(), Some("12"));
+
+        match mapper.map_event(key_event(KeyCode::Char('j'))) {
+            UiEvent::Command(Command::NextPage { count }) => assert_eq!(count, 12),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert!(mapper.pending_input().is_none());
+    }
+
+    #[test]
+    fn event_mapper_pending_input_shows_char_stack_until_completed() {
+        let mut mapper = EventMapper::new();
+        assert!(mapper.pending_input().is_none());
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('m'))),
+            UiEvent::None
+        ));
+        assert_eq!(mapper.pending_input().as_deref(), Some("m"));
+
+        match mapper.map_event(key_event(KeyCode::Char('G'))) {
+            UiEvent::Command(Command::PutMark { key }) => assert_eq!(key, 'G'),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert!(mapper.pending_input().is_none());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +217,7 @@ pub enum UiEvent {
 #[derive(Debug, Default)]
 pub struct EventMapper {
     pending_count: Option<usize>,
+    pending_digits: String,
     char_stack: String,
 }
 
@@ -263,17 +302,24 @@ impl EventMapper {
         let current = self.pending_count.unwrap_or(0);
         let next = current.saturating_mul(10).saturating_add(digit);
         self.pending_count = Some(next);
+        if let Some(c) = char::from_digit(digit as u32, 10) {
+            self.pending_digits.push(c);
+        }
     }
 
     fn take_count(&mut self) -> usize {
-        self.pending_count
+        let count = self
+            .pending_count
             .take()
             .filter(|&count| count > 0)
-            .unwrap_or(1)
+            .unwrap_or(1);
+        self.pending_digits.clear();
+        count
     }
 
     fn reset_count(&mut self) {
         self.pending_count = None;
+        self.pending_digits.clear();
     }
 
     fn push_char(&mut self, char: char) {
@@ -286,6 +332,17 @@ impl EventMapper {
     }
     fn reset_char_stack(&mut self) {
         self.char_stack = String::new();
+    }
+
+    pub fn pending_input(&self) -> Option<String> {
+        let mut pending = String::new();
+        if !self.pending_digits.is_empty() {
+            pending.push_str(&self.pending_digits);
+        }
+        if !self.char_stack.is_empty() {
+            pending.push_str(&self.char_stack);
+        }
+        if pending.is_empty() { None } else { Some(pending) }
     }
 }
 

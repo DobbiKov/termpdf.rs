@@ -367,7 +367,7 @@ impl Session {
             Command::GotoMark { key } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     let curr_page = doc.state.current_page;
-                    let page = doc.get_page_from_mark(key).unwrap_or(1);
+                    let page = doc.get_page_from_mark(key).unwrap_or(10);
                     // TODO: return
                     // error
                     let next = page.min(doc.info.page_count.saturating_sub(1));
