@@ -1,3 +1,4 @@
+use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use parking_lot::Mutex;
 use pdfium_render::prelude::*;
 use termpdf_core::{
     document_id_for_path, DocumentBackend, DocumentInfo, DocumentMetadata, DocumentProvider,
-    RenderImage, RenderRequest,
+    OutlineItem, RenderImage, RenderRequest,
 };
 use tracing::{instrument, warn};
 
@@ -47,6 +48,7 @@ struct PdfiumDocument {
     path: PathBuf,
     info: DocumentInfo,
     cache: Mutex<Option<RenderCacheEntry>>,
+    outline_cache: Mutex<Option<Vec<OutlineItem>>>,
 }
 
 struct RenderCacheEntry {
@@ -63,6 +65,7 @@ impl PdfiumDocument {
             path,
             info,
             cache: Mutex::new(None),
+            outline_cache: Mutex::new(None),
         }
     }
 
@@ -136,6 +139,54 @@ impl DocumentBackend for PdfiumDocument {
         });
 
         Ok(image)
+    }
+
+    fn outline(&self) -> Result<Vec<OutlineItem>> {
+        {
+            let cache = self.outline_cache.lock();
+            if let Some(cached) = cache.as_ref() {
+                return Ok(cached.clone());
+            }
+        }
+
+        let document = self.load_document()?;
+        let mut outline = Vec::new();
+
+        if let Some(root) = document.bookmarks().root() {
+            collect_outline(root, 0, &mut outline);
+        }
+
+        let mut cache = self.outline_cache.lock();
+        *cache = Some(outline.clone());
+
+        Ok(outline)
+    }
+}
+
+fn collect_outline(mut bookmark: PdfBookmark<'_>, depth: usize, out: &mut Vec<OutlineItem>) {
+    loop {
+        if let Some(title) = bookmark.title() {
+            if let Some(destination) = bookmark.destination() {
+                if let Ok(page_index) = destination.page_index() {
+                    if let Ok(page_index) = usize::try_from(page_index) {
+                        out.push(OutlineItem {
+                            title,
+                            page_index,
+                            depth,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(child) = bookmark.first_child() {
+            collect_outline(child, depth + 1, out);
+        }
+
+        match bookmark.next_sibling() {
+            Some(next) => bookmark = next,
+            None => break,
+        }
     }
 }
 

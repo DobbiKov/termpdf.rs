@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,11 +8,14 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::cursor;
 use crossterm::event;
+use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
-use termpdf_core::{Command, DocumentInstance, FileStateStore, RenderImage, Session, StateStore};
+use termpdf_core::{
+    Command, DocumentInstance, FileStateStore, OutlineItem, RenderImage, Session, StateStore,
+};
 use termpdf_render::PdfRenderFactory;
-use termpdf_tty::{write_status_line, DrawParams, EventMapper, KittyRenderer, UiEvent};
+use termpdf_tty::{write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent};
 use tracing::warn;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -81,10 +84,19 @@ async fn main() -> Result<()> {
     crossterm::execute!(stdout, cursor::Hide)?;
     let mut renderer = KittyRenderer::new(stdout);
     let mut event_mapper = EventMapper::new();
+    let mut overlay = OverlayState::None;
     let mut dirty = true;
     let mut needs_initial_clear = true;
 
     loop {
+        if overlay.is_active() {
+            if event_mapper.mode() != InputMode::Toc {
+                event_mapper.set_mode(InputMode::Toc);
+            }
+        } else if event_mapper.mode() != InputMode::Normal {
+            event_mapper.set_mode(InputMode::Normal);
+        }
+
         if dirty {
             let pending = event_mapper.pending_input();
             if needs_initial_clear {
@@ -94,7 +106,7 @@ async fn main() -> Result<()> {
                 }
                 needs_initial_clear = false;
             }
-            redraw(&mut renderer, &session, pending.as_deref())?;
+            redraw(&mut renderer, &session, pending.as_deref(), &mut overlay)?;
             dirty = false;
         }
 
@@ -102,13 +114,21 @@ async fn main() -> Result<()> {
             let ev = event::read()?;
             let ui_event = event_mapper.map_event(ev);
             let pending = event_mapper.pending_input();
-            if let Some(status) = combine_status(document_status(&session), pending.as_deref()) {
-                draw_status_line(&mut renderer, &status)?;
+            if !overlay.is_active() {
+                if let Some(status) = combine_status(document_status(&session), pending.as_deref())
+                {
+                    draw_status_line(&mut renderer, &status)?;
+                }
             }
-            match handle_event(ui_event, &mut session)? {
+            let overlay_was_active = overlay.is_active();
+            match handle_event(ui_event, &mut session, &mut overlay, &mut event_mapper)? {
                 LoopAction::ContinueRedraw => dirty = true,
                 LoopAction::Continue => {}
                 LoopAction::Quit => break,
+            }
+            if overlay.is_active() != overlay_was_active {
+                needs_initial_clear = true;
+                dirty = true;
             }
         }
     }
@@ -128,7 +148,124 @@ enum LoopAction {
     Quit,
 }
 
-fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
+enum OverlayState {
+    None,
+    Toc(TocWindow),
+}
+
+impl OverlayState {
+    fn deactivate(&mut self) {
+        *self = OverlayState::None;
+    }
+
+    fn is_active(&self) -> bool {
+        !matches!(self, OverlayState::None)
+    }
+
+    fn toc_mut(&mut self) -> Option<&mut TocWindow> {
+        match self {
+            OverlayState::Toc(ref mut toc) => Some(toc),
+            OverlayState::None => None,
+        }
+    }
+}
+
+struct TocWindow {
+    entries: Vec<OutlineItem>,
+    selected: usize,
+    scroll_offset: usize,
+}
+
+impl TocWindow {
+    fn from_outline(entries: Vec<OutlineItem>, current_page: usize) -> Self {
+        let mut selected = 0;
+        if !entries.is_empty() {
+            for (idx, item) in entries.iter().enumerate() {
+                if item.page_index <= current_page {
+                    selected = idx;
+                } else {
+                    break;
+                }
+            }
+        }
+        Self {
+            entries,
+            selected,
+            scroll_offset: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn selected_entry(&self) -> Option<&OutlineItem> {
+        self.entries.get(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let len = self.entries.len() as isize;
+        let next = (self.selected as isize + delta).clamp(0, len - 1) as usize;
+        if next != self.selected {
+            self.selected = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ensure_visible(&mut self, viewport_height: usize) {
+        if viewport_height == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        if self.entries.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        let max_offset = self.entries.len().saturating_sub(viewport_height.max(1));
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+            return;
+        }
+        let bottom = self.scroll_offset + viewport_height;
+        if self.selected >= bottom {
+            self.scroll_offset = self
+                .selected
+                .saturating_sub(viewport_height.saturating_sub(1));
+        }
+    }
+
+    fn update_selection_for_page(&mut self, current_page: usize) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        let mut next = 0;
+        for (idx, item) in self.entries.iter().enumerate() {
+            if item.page_index <= current_page {
+                next = idx;
+            } else {
+                break;
+            }
+        }
+        self.selected = next;
+    }
+}
+
+fn handle_event(
+    event: UiEvent,
+    session: &mut Session,
+    overlay: &mut OverlayState,
+    mapper: &mut EventMapper,
+) -> Result<LoopAction> {
     match event {
         UiEvent::Command(cmd) => {
             let redraw = matches!(
@@ -142,13 +279,74 @@ fn handle_event(event: UiEvent, session: &mut Session) -> Result<LoopAction> {
                     | Command::GotoMark { .. }
                     | Command::ToggleDarkMode
                     | Command::SwitchDocument { .. }
+                    | Command::CloseDocument { .. }
             );
+            let resets_overlay = matches!(
+                cmd,
+                Command::CloseDocument { .. } | Command::SwitchDocument { .. }
+            );
+
             session.apply(cmd)?;
-            if redraw {
+
+            if resets_overlay {
+                overlay.deactivate();
+                mapper.set_mode(InputMode::Normal);
+            } else if let OverlayState::Toc(toc) = overlay {
+                if let Some(doc) = session.active() {
+                    toc.update_selection_for_page(doc.state.current_page);
+                } else {
+                    overlay.deactivate();
+                    mapper.set_mode(InputMode::Normal);
+                }
+            }
+
+            if redraw || resets_overlay {
                 Ok(LoopAction::ContinueRedraw)
             } else {
                 Ok(LoopAction::Continue)
             }
+        }
+        UiEvent::OpenTableOfContents => {
+            if let Some(doc) = session.active() {
+                let entries = doc.outline().to_vec();
+                let toc = TocWindow::from_outline(entries, doc.state.current_page);
+                *overlay = OverlayState::Toc(toc);
+                mapper.set_mode(InputMode::Toc);
+                Ok(LoopAction::ContinueRedraw)
+            } else {
+                Ok(LoopAction::Continue)
+            }
+        }
+        UiEvent::CloseOverlay => {
+            if overlay.is_active() {
+                overlay.deactivate();
+                mapper.set_mode(InputMode::Normal);
+                Ok(LoopAction::ContinueRedraw)
+            } else {
+                Ok(LoopAction::Continue)
+            }
+        }
+        UiEvent::TocMoveSelection { delta } => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.move_selection(delta) {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocActivateSelection => {
+            if let OverlayState::Toc(toc) = overlay {
+                if let Some(entry) = toc.selected_entry() {
+                    session.apply(Command::GotoPage {
+                        page: entry.page_index,
+                    })?;
+                    if let Some(doc) = session.active() {
+                        toc.update_selection_for_page(doc.state.current_page);
+                    }
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
         }
         UiEvent::Quit => Ok(LoopAction::Quit),
         UiEvent::None => Ok(LoopAction::Continue),
@@ -159,15 +357,25 @@ fn redraw(
     renderer: &mut KittyRenderer<io::Stdout>,
     session: &Session,
     pending_input: Option<&str>,
+    overlay: &mut OverlayState,
 ) -> Result<()> {
-    if let Some(doc) = session.active() {
-        let window = terminal::window_size()?;
-        let total_cols = u32::from(window.columns).max(1);
-        let total_rows = u32::from(window.rows).max(1);
-        let pixel_width = u32::from(window.width);
-        let pixel_height = u32::from(window.height);
+    let window = terminal::window_size()?;
+    let total_cols = u32::from(window.columns).max(1);
+    let total_rows = u32::from(window.rows).max(1);
+    let pixel_width = u32::from(window.width);
+    let pixel_height = u32::from(window.height);
+    let image_rows_available = total_rows.saturating_sub(1).max(1);
 
-        let image_rows_available = total_rows.saturating_sub(1).max(1);
+    if let Some(doc) = session.active() {
+        if overlay.is_active() {
+            {
+                let mut writer = renderer.writer();
+                crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+            }
+            draw_overlay(renderer, overlay, total_cols, image_rows_available)?;
+            return Ok(());
+        }
+
         let margin_cols = total_cols.min(2);
         let margin_rows = image_rows_available.min(2);
         let available_cols = total_cols.saturating_sub(margin_cols).max(1);
@@ -286,7 +494,12 @@ fn redraw(
                 "failed to prefetch neighboring pages"
             );
         }
+
+        draw_overlay(renderer, overlay, total_cols, image_rows_available)?;
+    } else {
+        overlay.deactivate();
     }
+
     Ok(())
 }
 
@@ -319,6 +532,188 @@ fn draw_status_line(renderer: &mut KittyRenderer<io::Stdout>, status: &str) -> R
     )?;
     write_status_line(&mut writer, status)?;
     Ok(())
+}
+
+fn draw_overlay(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    overlay: &mut OverlayState,
+    total_cols: u32,
+    image_rows_available: u32,
+) -> Result<()> {
+    match overlay {
+        OverlayState::Toc(toc) => draw_toc_overlay(renderer, toc, total_cols, image_rows_available),
+        OverlayState::None => Ok(()),
+    }
+}
+
+fn draw_toc_overlay(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    toc: &mut TocWindow,
+    total_cols: u32,
+    image_rows_available: u32,
+) -> Result<()> {
+    const TITLE: &str = "Table of Contents";
+    const EMPTY_MESSAGE: &str = "No table of contents available";
+
+    if total_cols < 20 || image_rows_available < 6 {
+        return Ok(());
+    }
+
+    let max_inner_width = total_cols.saturating_sub(6) as usize;
+    if max_inner_width < 10 {
+        return Ok(());
+    }
+
+    let base_width = if toc.is_empty() {
+        EMPTY_MESSAGE.len() + 2
+    } else {
+        toc.entries
+            .iter()
+            .map(toc_line_length)
+            .max()
+            .unwrap_or(0)
+            .max(TITLE.len())
+    };
+
+    let mut inner_width = base_width.min(max_inner_width);
+    let min_inner_width = 20.min(max_inner_width);
+    if inner_width < min_inner_width {
+        inner_width = min_inner_width;
+    }
+
+    let max_window_height = image_rows_available.saturating_sub(2);
+    if max_window_height < 6 {
+        return Ok(());
+    }
+    let max_content_height = max_window_height.saturating_sub(4) as usize;
+    if max_content_height == 0 {
+        return Ok(());
+    }
+
+    let total_entries = if toc.is_empty() { 1 } else { toc.entries.len() };
+    let content_height = total_entries.min(max_content_height).max(1);
+    toc.ensure_visible(content_height);
+    let max_scroll = total_entries.saturating_sub(content_height);
+    if toc.scroll_offset > max_scroll {
+        toc.scroll_offset = max_scroll;
+    }
+
+    let window_height = (content_height + 4) as u32;
+    if window_height > max_window_height {
+        return Ok(());
+    }
+    let window_width = (inner_width + 2) as u32;
+    if window_width > total_cols {
+        return Ok(());
+    }
+
+    let start_col = (total_cols.saturating_sub(window_width)) / 2;
+    let start_row = (image_rows_available.saturating_sub(window_height)) / 2;
+
+    let mut writer = renderer.writer();
+    let mut current_row = start_row as u16;
+    let start_col_u16 = start_col as u16;
+    let horizontal_border = "-".repeat(inner_width);
+
+    print_inverted(
+        &mut writer,
+        start_col_u16,
+        current_row,
+        &format!("+{}+", horizontal_border),
+    )?;
+    current_row = current_row.saturating_add(1);
+
+    let title_line = format!("|{: ^inner_width$}|", TITLE, inner_width = inner_width);
+    print_inverted(&mut writer, start_col_u16, current_row, &title_line)?;
+    current_row = current_row.saturating_add(1);
+
+    let divider = format!("|{}|", "-".repeat(inner_width));
+    print_inverted(&mut writer, start_col_u16, current_row, &divider)?;
+    current_row = current_row.saturating_add(1);
+
+    if toc.is_empty() {
+        let content = truncate_with_ellipsis(format!("  {}", EMPTY_MESSAGE), inner_width);
+        let line = format!("|{}|", content);
+        print_inverted(&mut writer, start_col_u16, current_row, &line)?;
+        current_row = current_row.saturating_add(1);
+    } else {
+        let start_index = toc.scroll_offset;
+        let end_index = (start_index + content_height).min(toc.entries.len());
+        for idx in start_index..end_index {
+            let entry = &toc.entries[idx];
+            let selected = idx == toc.selected;
+            let content = format_toc_line(entry, selected, inner_width);
+            let line = format!("|{}|", content);
+            print_inverted(&mut writer, start_col_u16, current_row, &line)?;
+            current_row = current_row.saturating_add(1);
+        }
+
+        let rendered = end_index - start_index;
+        for _ in rendered..content_height {
+            let line = format!("|{}|", " ".repeat(inner_width));
+            print_inverted(&mut writer, start_col_u16, current_row, &line)?;
+            current_row = current_row.saturating_add(1);
+        }
+    }
+
+    print_inverted(
+        &mut writer,
+        start_col_u16,
+        current_row,
+        &format!("+{}+", horizontal_border),
+    )?;
+
+    Ok(())
+}
+
+fn print_inverted(writer: &mut impl Write, col: u16, row: u16, content: &str) -> Result<()> {
+    crossterm::execute!(
+        writer,
+        cursor::MoveTo(col, row),
+        SetAttribute(Attribute::Reverse),
+        Print(content),
+        SetAttribute(Attribute::Reset)
+    )?;
+    Ok(())
+}
+
+fn toc_line_length(entry: &OutlineItem) -> usize {
+    let indent_levels = entry.depth.min(8);
+    let indent_width = indent_levels * 2;
+    let page_suffix = format!(" (p{})", entry.page_index + 1);
+    2 + indent_width + entry.title.len() + page_suffix.len()
+}
+
+fn format_toc_line(entry: &OutlineItem, selected: bool, inner_width: usize) -> String {
+    let marker = if selected { '>' } else { ' ' };
+    let indent_levels = entry.depth.min(8);
+    let indent = "  ".repeat(indent_levels);
+    let page_suffix = format!(" (p{})", entry.page_index + 1);
+
+    let mut text = String::new();
+    text.push(marker);
+    text.push(' ');
+    text.push_str(&indent);
+    text.push_str(&entry.title);
+    text.push_str(&page_suffix);
+
+    truncate_with_ellipsis(text, inner_width)
+}
+
+fn truncate_with_ellipsis(mut text: String, width: usize) -> String {
+    if text.len() > width {
+        if width <= 3 {
+            text.truncate(width);
+        } else {
+            let mut truncated = text.chars().take(width - 3).collect::<String>();
+            truncated.push_str("...");
+            text = truncated;
+        }
+    }
+    if text.len() < width {
+        text.push_str(&" ".repeat(width - text.len()));
+    }
+    text
 }
 
 fn init_logging(project_dirs: &ProjectDirs) -> Result<WorkerGuard> {

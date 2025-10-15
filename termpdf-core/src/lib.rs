@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Error, Result};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
+use tracing::{instrument, warn};
 use uuid::Uuid;
 
 pub type DocumentId = Uuid;
@@ -37,6 +37,13 @@ pub struct DocumentMetadata {
     pub title: Option<String>,
     pub author: Option<String>,
     pub keywords: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutlineItem {
+    pub title: String,
+    pub page_index: usize,
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -143,6 +150,7 @@ pub struct DocumentInstance {
     pub backend: Arc<dyn DocumentBackend>,
     pub state: PersistedDocumentState,
     render_cache: Mutex<HashMap<CacheKey, RenderImage>>,
+    outline: Vec<OutlineItem>,
 }
 
 impl DocumentInstance {
@@ -150,12 +158,14 @@ impl DocumentInstance {
         info: DocumentInfo,
         backend: Arc<dyn DocumentBackend>,
         state: PersistedDocumentState,
+        outline: Vec<OutlineItem>,
     ) -> Self {
         Self {
             info,
             backend,
             state,
             render_cache: Mutex::new(HashMap::new()),
+            outline,
         }
     }
 
@@ -255,6 +265,10 @@ impl DocumentInstance {
             }
         }
     }
+
+    pub fn outline(&self) -> &[OutlineItem] {
+        &self.outline
+    }
 }
 
 const CACHE_CAPACITY: usize = 10;
@@ -318,6 +332,9 @@ pub enum SessionEvent {
 pub trait DocumentBackend: Send + Sync {
     fn info(&self) -> &DocumentInfo;
     fn render_page(&self, request: RenderRequest) -> Result<RenderImage>;
+    fn outline(&self) -> Result<Vec<OutlineItem>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait::async_trait]
@@ -414,7 +431,18 @@ impl Session {
         let backend = provider.open(&path).await?;
         let info = backend.info().clone();
         let state = self.store.load(&info)?.unwrap_or_default();
-        let doc = DocumentInstance::new(info.clone(), backend, state);
+        let outline = match backend.outline() {
+            Ok(outline) => outline,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    path = %info.path.display(),
+                    "failed to load document outline"
+                );
+                Vec::new()
+            }
+        };
+        let doc = DocumentInstance::new(info.clone(), backend, state, outline);
         self.documents.push(doc);
         self.active = self.documents.len().saturating_sub(1);
         self.events

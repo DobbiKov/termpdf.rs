@@ -58,7 +58,7 @@ impl<W: Write> KittyRenderer<W> {
             if first {
                 write!(
                     self.writer,
-                    "\u{1b}_Ga=T,f=100,C=1,q=2,i={},p={},c={},r={},s={},v={},m={}",
+                    "\u{1b}_Ga=T,f=100,C=1,q=2,i={},p={},c={},r={},s={},v={},z=-1,m={}",
                     self.image_id,
                     self.placement_id,
                     params.columns,
@@ -282,13 +282,79 @@ mod tests {
             other => panic!("unexpected event: {:?}", other),
         }
     }
+
+    #[test]
+    fn event_mapper_maps_t_to_open_toc() {
+        let mut mapper = EventMapper::new();
+        match mapper.map_event(key_event(KeyCode::Char('t'))) {
+            UiEvent::OpenTableOfContents => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_toc_mode_maps_navigation_keys() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Toc);
+
+        match mapper.map_event(key_event(KeyCode::Char('j'))) {
+            UiEvent::TocMoveSelection { delta } => assert_eq!(delta, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Char('k'))) {
+            UiEvent::TocMoveSelection { delta } => assert_eq!(delta, -1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Enter)) {
+            UiEvent::TocActivateSelection => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Esc)) {
+            UiEvent::CloseOverlay => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_switching_modes_clears_pending_state() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('1'))),
+            UiEvent::None
+        ));
+        assert_eq!(mapper.pending_input().as_deref(), Some("1"));
+
+        mapper.set_mode(InputMode::Toc);
+        assert!(mapper.pending_input().is_none());
+        mapper.set_mode(InputMode::Normal);
+        assert!(mapper.pending_input().is_none());
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Command(Command),
+    OpenTableOfContents,
+    CloseOverlay,
+    TocMoveSelection { delta: isize },
+    TocActivateSelection,
     Quit,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Toc,
+}
+
+impl Default for InputMode {
+    fn default() -> Self {
+        InputMode::Normal
+    }
 }
 
 #[derive(Debug, Default)]
@@ -296,6 +362,7 @@ pub struct EventMapper {
     pending_count: Option<usize>,
     pending_digits: String,
     char_stack: String,
+    mode: InputMode,
 }
 
 impl EventMapper {
@@ -305,7 +372,26 @@ impl EventMapper {
         Self::default()
     }
 
+    pub fn set_mode(&mut self, mode: InputMode) {
+        if self.mode != mode {
+            self.reset_count();
+            self.reset_char_stack();
+            self.mode = mode;
+        }
+    }
+
+    pub fn mode(&self) -> InputMode {
+        self.mode
+    }
+
     pub fn map_event(&mut self, event: Event) -> UiEvent {
+        match self.mode {
+            InputMode::Normal => self.map_event_normal(event),
+            InputMode::Toc => self.map_event_toc(event),
+        }
+    }
+
+    fn map_event_normal(&mut self, event: Event) -> UiEvent {
         match event {
             Event::Key(KeyEvent {
                 code, modifiers, ..
@@ -391,11 +477,37 @@ impl EventMapper {
                     self.reset_count();
                     UiEvent::Command(Command::GotoPage { page: usize::MAX })
                 }
+                (KeyCode::Char('t'), _) | (KeyCode::Char('T'), _) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::OpenTableOfContents
+                }
                 _ => {
                     self.reset_count();
                     UiEvent::None
                 }
             },
+            _ => UiEvent::None,
+        }
+    }
+
+    fn map_event_toc(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => {
+                match (code, modifiers) {
+                    (KeyCode::Esc, _) => UiEvent::CloseOverlay,
+                    (KeyCode::Char('t'), _) | (KeyCode::Char('T'), _) => UiEvent::CloseOverlay,
+                    (KeyCode::Enter, _) => UiEvent::TocActivateSelection,
+                    (KeyCode::Char('j'), KeyModifiers::NONE)
+                    | (KeyCode::Down, KeyModifiers::NONE) => UiEvent::TocMoveSelection { delta: 1 },
+                    (KeyCode::Char('k'), KeyModifiers::NONE)
+                    | (KeyCode::Up, KeyModifiers::NONE) => UiEvent::TocMoveSelection { delta: -1 },
+                    (KeyCode::Char('q'), _) => UiEvent::Quit,
+                    _ => UiEvent::None,
+                }
+            }
             _ => UiEvent::None,
         }
     }
