@@ -5,6 +5,7 @@ Kitty-native PDF viewer rewrite in Rust. The workspace currently ships a single 
 ## Current Capabilities
 - Render PDF pages inside Kitty via its graphics protocol; the PDF backend is the only backend implemented today.
 - Vim-flavoured navigation (`j/k`, `g/G`, `+/-`, `d`, `q`) with numeric prefixes (`12j`), mark support (`m<char>` to set, `'<char>` to jump), and jump history (`Ctrl-o`/`Ctrl-i`).
+- Inline search (`/pattern`) with live feedback, highlighted matches, and `n`/`N` navigation.
 - Automatic page scaling that fits the current terminal window plus a dark-mode inversion toggle.
 - Prefetch and cache of neighbouring pages to keep navigation snappy.
 - Accept multiple files on the CLI; the last one opened becomes the active document in the viewer.

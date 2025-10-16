@@ -226,6 +226,66 @@ impl JumpHistory {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SearchMatch {
+    page: usize,
+    rects: Vec<NormalizedRect>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchState {
+    query: String,
+    matches: Vec<SearchMatch>,
+    current_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchSummary {
+    pub query: String,
+    pub total: usize,
+    pub current_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormalizedRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl NormalizedRect {
+    pub fn clamp(mut self) -> Self {
+        self.left = self.left.clamp(0.0, 1.0);
+        self.top = self.top.clamp(0.0, 1.0);
+        self.right = self.right.clamp(0.0, 1.0);
+        self.bottom = self.bottom.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.right > self.left && self.bottom > self.top
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchHighlights {
+    pub current: Vec<NormalizedRect>,
+    pub others: Vec<NormalizedRect>,
+}
+
+impl SearchHighlights {
+    pub fn is_empty(&self) -> bool {
+        self.current.is_empty() && self.others.is_empty()
+    }
+}
+
+#[derive(Copy, Clone)]
+enum SearchDirection {
+    Forward,
+    Backward,
+}
+
 pub struct DocumentInstance {
     pub info: DocumentInfo,
     pub backend: Arc<dyn DocumentBackend>,
@@ -233,6 +293,8 @@ pub struct DocumentInstance {
     render_cache: Mutex<HashMap<CacheKey, RenderImage>>,
     outline: Vec<OutlineItem>,
     jump_history: JumpHistory,
+    text_cache: Mutex<HashMap<usize, Arc<String>>>,
+    search_state: Option<SearchState>,
 }
 
 impl DocumentInstance {
@@ -249,6 +311,8 @@ impl DocumentInstance {
             render_cache: Mutex::new(HashMap::new()),
             outline,
             jump_history: JumpHistory::default(),
+            text_cache: Mutex::new(HashMap::new()),
+            search_state: None,
         };
         let initial = instance.current_position();
         instance.jump_history.record_initial(initial);
@@ -399,6 +463,226 @@ impl DocumentInstance {
         self.jump_history.jump_forward(current)
     }
 
+    fn load_page_text(&self, page_index: usize) -> Result<Arc<String>> {
+        if page_index >= self.info.page_count {
+            return Err(anyhow!("page {} out of range", page_index));
+        }
+
+        if let Some(text) = self.text_cache.lock().get(&page_index).cloned() {
+            return Ok(text);
+        }
+
+        let text = self.backend.page_text(page_index)?;
+        let text = Arc::new(text);
+        self.text_cache.lock().insert(page_index, Arc::clone(&text));
+        Ok(text)
+    }
+
+    fn build_search_matches(&self, query: &str) -> Result<Vec<SearchMatch>> {
+        let mut matches = Vec::new();
+
+        if query.is_empty() {
+            return Ok(matches);
+        }
+
+        let query_lower = query.to_lowercase();
+        let step = query_lower.len().max(1);
+
+        for page in 0..self.info.page_count {
+            let mut page_matches = match self.backend.search_page(page, query) {
+                Ok(rect_sets) => rect_sets,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        page,
+                        path = %self.info.path.display(),
+                        "backend search failed; falling back to text search"
+                    );
+                    Vec::new()
+                }
+            };
+
+            if !page_matches.is_empty() {
+                for rects in page_matches.drain(..) {
+                    let rects: Vec<NormalizedRect> = rects
+                        .into_iter()
+                        .map(|rect| rect.clamp())
+                        .filter(|rect| rect.is_valid())
+                        .collect();
+                    matches.push(SearchMatch { page, rects });
+                }
+                continue;
+            }
+
+            match self.load_page_text(page) {
+                Ok(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    let lower = text.to_lowercase();
+                    let mut offset = 0usize;
+                    while offset < lower.len() {
+                        if let Some(pos) = lower[offset..].find(&query_lower) {
+                            let absolute = offset + pos;
+                            matches.push(SearchMatch {
+                                page,
+                                rects: Vec::new(),
+                            });
+                            let next = absolute.saturating_add(step);
+                            if next <= offset {
+                                break;
+                            }
+                            offset = next;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        page,
+                        path = %self.info.path.display(),
+                        "failed to extract text for search"
+                    );
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
+    pub fn perform_search(&mut self, query: String) -> Result<bool> {
+        let trimmed = query.trim().to_string();
+
+        if trimmed.is_empty() {
+            self.search_state = None;
+            self.sync_jump_position();
+            return Ok(false);
+        }
+
+        let matches = self.build_search_matches(&trimmed)?;
+        let start_page = self.state.current_page;
+        let next_index = if matches.is_empty() {
+            None
+        } else {
+            Some(
+                matches
+                    .iter()
+                    .position(|m| m.page >= start_page)
+                    .unwrap_or(0),
+            )
+        };
+
+        self.search_state = Some(SearchState {
+            query: trimmed,
+            matches,
+            current_index: next_index,
+        });
+
+        if let Some(idx) = next_index {
+            Ok(self.apply_search_index(idx))
+        } else {
+            self.sync_jump_position();
+            Ok(false)
+        }
+    }
+
+    pub fn next_search_match(&mut self, count: usize) -> Option<bool> {
+        self.advance_search(SearchDirection::Forward, count)
+    }
+
+    pub fn previous_search_match(&mut self, count: usize) -> Option<bool> {
+        self.advance_search(SearchDirection::Backward, count)
+    }
+
+    fn advance_search(&mut self, direction: SearchDirection, count: usize) -> Option<bool> {
+        if count == 0 {
+            return Some(false);
+        }
+
+        let (total, current) = match self.search_state.as_ref() {
+            Some(state) if !state.matches.is_empty() => {
+                (state.matches.len(), state.current_index.unwrap_or(0))
+            }
+            Some(_) => return Some(false),
+            None => return None,
+        };
+
+        if total == 0 {
+            return Some(false);
+        }
+
+        let steps = count % total;
+        if steps == 0 {
+            return Some(self.apply_search_index(current));
+        }
+
+        let target = match direction {
+            SearchDirection::Forward => (current + steps) % total,
+            SearchDirection::Backward => (current + total - steps) % total,
+        };
+
+        Some(self.apply_search_index(target))
+    }
+
+    fn apply_search_index(&mut self, index: usize) -> bool {
+        let Some(state) = self.search_state.as_mut() else {
+            return false;
+        };
+
+        if state.matches.is_empty() || index >= state.matches.len() {
+            state.current_index = None;
+            return false;
+        }
+
+        state.current_index = Some(index);
+        let target_page = state.matches[index]
+            .page
+            .min(self.info.page_count.saturating_sub(1));
+        let previous = self.current_position();
+        let changed = if target_page != self.state.current_page {
+            self.state.current_page = target_page;
+            self.state.viewport.reset();
+            self.record_jump_from(previous);
+            true
+        } else {
+            false
+        };
+        self.sync_jump_position();
+        changed
+    }
+
+    pub fn search_summary(&self) -> Option<SearchSummary> {
+        self.search_state.as_ref().map(|state| SearchSummary {
+            query: state.query.clone(),
+            total: state.matches.len(),
+            current_index: state.current_index,
+        })
+    }
+
+    pub fn search_highlights_for_current_page(&self) -> Option<SearchHighlights> {
+        let state = self.search_state.as_ref()?;
+        let current_page = self.state.current_page;
+        let mut highlights = SearchHighlights::default();
+        for (idx, match_entry) in state.matches.iter().enumerate() {
+            if match_entry.page != current_page {
+                continue;
+            }
+            if Some(idx) == state.current_index {
+                highlights.current.extend(match_entry.rects.iter().copied());
+            } else {
+                highlights.others.extend(match_entry.rects.iter().copied());
+            }
+        }
+        if highlights.is_empty() {
+            None
+        } else {
+            Some(highlights)
+        }
+    }
+
     fn try_get_cached(&self, key: &CacheKey) -> Option<RenderImage> {
         self.render_cache.lock().get(key).cloned()
     }
@@ -465,6 +749,9 @@ pub enum Command {
     AdjustViewport { delta_x: f32, delta_y: f32 },
     PutMark { key: char },
     GotoMark { key: char },
+    Search { query: String },
+    SearchNext { count: usize },
+    SearchPrev { count: usize },
     ToggleDarkMode,
     SwitchDocument { index: usize },
     CloseDocument { index: usize },
@@ -485,6 +772,12 @@ pub trait DocumentBackend: Send + Sync {
     fn info(&self) -> &DocumentInfo;
     fn render_page(&self, request: RenderRequest) -> Result<RenderImage>;
     fn outline(&self) -> Result<Vec<OutlineItem>> {
+        Ok(Vec::new())
+    }
+    fn page_text(&self, _page_index: usize) -> Result<String> {
+        Err(anyhow!("text extraction not supported"))
+    }
+    fn search_page(&self, _page_index: usize, _query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
         Ok(Vec::new())
     }
 }
@@ -627,6 +920,32 @@ impl Session {
                                 .lock()
                                 .push(SessionEvent::RedrawNeeded(doc.info.id));
                         }
+                    }
+                }
+            }
+            Command::Search { query } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    doc.perform_search(query)?;
+                    self.events
+                        .lock()
+                        .push(SessionEvent::RedrawNeeded(doc.info.id));
+                }
+            }
+            Command::SearchNext { count } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.next_search_match(count.max(1)).is_some() {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::SearchPrev { count } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.previous_search_match(count.max(1)).is_some() {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
                     }
                 }
             }
@@ -852,6 +1171,27 @@ mod tests {
                 pixels: vec![request.page_index as u8],
             })
         }
+
+        fn page_text(&self, page_index: usize) -> Result<String> {
+            Ok(format!("This is sample page {} with keyword", page_index))
+        }
+
+        fn search_page(&self, page_index: usize, query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
+            if query.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let text = format!("This is sample page {} with keyword", page_index);
+            if text.to_lowercase().contains(&query.to_lowercase()) {
+                Ok(vec![vec![NormalizedRect {
+                    left: 0.1,
+                    top: 0.1,
+                    right: 0.9,
+                    bottom: 0.2,
+                }]])
+            } else {
+                Ok(Vec::new())
+            }
+        }
     }
 
     struct FakeProvider;
@@ -942,6 +1282,80 @@ mod tests {
 
         session.apply(Command::JumpForward).unwrap();
         assert_eq!(session.active().unwrap().state.current_page, 40);
+    }
+
+    #[tokio::test]
+    async fn session_search_navigates_matches() {
+        let store = Arc::new(MemoryStateStore::new());
+        let mut session = Session::new(store);
+        let provider = FakeProvider;
+        session
+            .open_with(&provider, PathBuf::from("/tmp/example.pdf"))
+            .await
+            .unwrap();
+
+        session
+            .apply(Command::Search {
+                query: "KEYWORD".to_string(),
+            })
+            .unwrap();
+        {
+            let doc = session.active().unwrap();
+            assert_eq!(doc.state.current_page, 0);
+            let summary = doc.search_summary().unwrap();
+            assert_eq!(summary.total, doc.info.page_count);
+            assert_eq!(summary.current_index, Some(0));
+            let highlights = doc.search_highlights_for_current_page().unwrap();
+            assert!(!highlights.current.is_empty() || !highlights.others.is_empty());
+        }
+
+        session.apply(Command::GotoPage { page: 5 }).unwrap();
+        session
+            .apply(Command::Search {
+                query: "keyword".to_string(),
+            })
+            .unwrap();
+        {
+            let doc = session.active().unwrap();
+            assert_eq!(doc.state.current_page, 5);
+            let summary = doc.search_summary().unwrap();
+            assert_eq!(summary.current_index, Some(5));
+            let highlights = doc.search_highlights_for_current_page().unwrap();
+            assert!(!highlights.current.is_empty());
+        }
+
+        session.apply(Command::SearchNext { count: 1 }).unwrap();
+        {
+            let doc = session.active().unwrap();
+            assert_eq!(doc.state.current_page, 6);
+            let summary = doc.search_summary().unwrap();
+            assert_eq!(summary.current_index, Some(6));
+            let highlights = doc.search_highlights_for_current_page().unwrap();
+            assert!(!highlights.current.is_empty());
+        }
+
+        session.apply(Command::SearchPrev { count: 2 }).unwrap();
+        {
+            let doc = session.active().unwrap();
+            assert_eq!(doc.state.current_page, 4);
+            let summary = doc.search_summary().unwrap();
+            assert_eq!(summary.current_index, Some(4));
+            let highlights = doc.search_highlights_for_current_page().unwrap();
+            assert!(!highlights.current.is_empty());
+        }
+
+        session
+            .apply(Command::Search {
+                query: "missing".to_string(),
+            })
+            .unwrap();
+        {
+            let doc = session.active().unwrap();
+            let summary = doc.search_summary().unwrap();
+            assert_eq!(summary.total, 0);
+            assert!(summary.current_index.is_none());
+            assert!(doc.search_highlights_for_current_page().is_none());
+        }
     }
 
     #[test]

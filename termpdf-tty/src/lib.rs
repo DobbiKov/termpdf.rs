@@ -330,6 +330,68 @@ mod tests {
     }
 
     #[test]
+    fn event_mapper_maps_n_and_uppercase_n_to_search_navigation() {
+        let mut mapper = EventMapper::new();
+
+        match mapper.map_event(key_event(KeyCode::Char('n'))) {
+            UiEvent::Command(Command::SearchNext { count }) => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT,
+        )) {
+            UiEvent::Command(Command::SearchPrev { count }) => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('3'))),
+            UiEvent::None
+        ));
+
+        match mapper.map_event(key_event(KeyCode::Char('n'))) {
+            UiEvent::Command(Command::SearchNext { count }) => assert_eq!(count, 3),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_slash_enters_search_mode_and_collects_input() {
+        let mut mapper = EventMapper::new();
+
+        match mapper.map_event(key_event(KeyCode::Char('/'))) {
+            UiEvent::BeginSearch => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.pending_input().as_deref(), Some("/"));
+
+        match mapper.map_event(key_event(KeyCode::Char('f'))) {
+            UiEvent::SearchQueryChanged { ref query } => assert_eq!(query, "f"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.pending_input().as_deref(), Some("/f"));
+
+        match mapper.map_event(key_event(KeyCode::Backspace)) {
+            UiEvent::SearchQueryChanged { ref query } => assert!(query.is_empty()),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.pending_input().as_deref(), Some("/"));
+
+        match mapper.map_event(key_event(KeyCode::Char('g'))) {
+            UiEvent::SearchQueryChanged { ref query } => assert_eq!(query, "g"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Enter)) {
+            UiEvent::SearchSubmit { ref query } => assert_eq!(query, "g"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert!(mapper.pending_input().is_none());
+    }
+
+    #[test]
     fn event_mapper_toc_mode_maps_navigation_keys() {
         let mut mapper = EventMapper::new();
         mapper.set_mode(InputMode::Toc);
@@ -368,6 +430,15 @@ mod tests {
         assert!(mapper.pending_input().is_none());
         mapper.set_mode(InputMode::Normal);
         assert!(mapper.pending_input().is_none());
+
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('/'))),
+            UiEvent::BeginSearch
+        ));
+        assert_eq!(mapper.pending_input().as_deref(), Some("/"));
+
+        mapper.set_mode(InputMode::Normal);
+        assert!(mapper.pending_input().is_none());
     }
 }
 
@@ -378,6 +449,10 @@ pub enum UiEvent {
     CloseOverlay,
     TocMoveSelection { delta: isize },
     TocActivateSelection,
+    BeginSearch,
+    SearchQueryChanged { query: String },
+    SearchSubmit { query: String },
+    SearchCancel,
     Quit,
     None,
 }
@@ -386,6 +461,7 @@ pub enum UiEvent {
 pub enum InputMode {
     Normal,
     Toc,
+    Search,
 }
 
 impl Default for InputMode {
@@ -400,6 +476,7 @@ pub struct EventMapper {
     pending_digits: String,
     char_stack: String,
     mode: InputMode,
+    search_buffer: String,
 }
 
 impl EventMapper {
@@ -411,9 +488,15 @@ impl EventMapper {
 
     pub fn set_mode(&mut self, mode: InputMode) {
         if self.mode != mode {
+            if matches!(self.mode, InputMode::Search) {
+                self.search_buffer.clear();
+            }
             self.reset_count();
             self.reset_char_stack();
             self.mode = mode;
+            if matches!(self.mode, InputMode::Search) {
+                self.search_buffer.clear();
+            }
         }
     }
 
@@ -425,6 +508,7 @@ impl EventMapper {
         match self.mode {
             InputMode::Normal => self.map_event_normal(event),
             InputMode::Toc => self.map_event_toc(event),
+            InputMode::Search => self.map_event_search(event),
         }
     }
 
@@ -489,6 +573,20 @@ impl EventMapper {
                 (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, KeyModifiers::NONE) => {
                     let count = self.take_count();
                     UiEvent::Command(Command::PrevPage { count })
+                }
+                (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                    self.start_search();
+                    UiEvent::BeginSearch
+                }
+                (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                    let count = self.take_count();
+                    UiEvent::Command(Command::SearchNext { count })
+                }
+                (KeyCode::Char('N'), modifiers)
+                    if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+                {
+                    let count = self.take_count();
+                    UiEvent::Command(Command::SearchPrev { count })
                 }
                 (KeyCode::Char('q'), _) => {
                     self.reset_count();
@@ -566,6 +664,38 @@ impl EventMapper {
         }
     }
 
+    fn map_event_search(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.set_mode(InputMode::Normal);
+                    UiEvent::SearchCancel
+                }
+                (KeyCode::Enter, _) => {
+                    let query = self.search_buffer.clone();
+                    self.set_mode(InputMode::Normal);
+                    UiEvent::SearchSubmit { query }
+                }
+                (KeyCode::Backspace, _) => {
+                    self.search_buffer.pop();
+                    UiEvent::SearchQueryChanged {
+                        query: self.search_buffer.clone(),
+                    }
+                }
+                (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.search_buffer.push(c);
+                    UiEvent::SearchQueryChanged {
+                        query: self.search_buffer.clone(),
+                    }
+                }
+                _ => UiEvent::None,
+            },
+            _ => UiEvent::None,
+        }
+    }
+
     fn push_digit(&mut self, digit: usize) {
         let current = self.pending_count.unwrap_or(0);
         let next = current.saturating_mul(10).saturating_add(digit);
@@ -597,6 +727,10 @@ impl EventMapper {
         self.char_stack = String::new();
     }
 
+    fn start_search(&mut self) {
+        self.set_mode(InputMode::Search);
+    }
+
     fn pan(&mut self, delta_x: f32, delta_y: f32) -> UiEvent {
         let multiplier = self.take_count() as f32;
         self.reset_char_stack();
@@ -607,6 +741,9 @@ impl EventMapper {
     }
 
     pub fn pending_input(&self) -> Option<String> {
+        if matches!(self.mode, InputMode::Search) {
+            return Some(format!("/{}", self.search_buffer));
+        }
         let mut pending = String::new();
         if !self.pending_digits.is_empty() {
             pending.push_str(&self.pending_digits);

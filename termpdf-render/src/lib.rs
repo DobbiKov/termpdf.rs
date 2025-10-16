@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use pdfium_render::prelude::*;
 use termpdf_core::{
     document_id_for_path, DocumentBackend, DocumentInfo, DocumentMetadata, DocumentProvider,
-    OutlineItem, RenderImage, RenderRequest,
+    NormalizedRect, OutlineItem, RenderImage, RenderRequest,
 };
 use tracing::{instrument, warn};
 
@@ -161,6 +161,77 @@ impl DocumentBackend for PdfiumDocument {
 
         Ok(outline)
     }
+
+    fn page_text(&self, page_index: usize) -> Result<String> {
+        let document = self.load_document()?;
+        let page_index: PdfPageIndex = page_index
+            .try_into()
+            .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {} out of range", page_index))?;
+        let text = page
+            .text()
+            .with_context(|| format!("failed to extract text for page {}", page_index))?;
+        Ok(text.all())
+    }
+
+    fn search_page(&self, page_index: usize, query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let document = self.load_document()?;
+        let page_index: PdfPageIndex = page_index
+            .try_into()
+            .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {} out of range", page_index))?;
+        let text = page
+            .text()
+            .with_context(|| format!("failed to extract text for page {}", page_index))?;
+
+        let options = PdfSearchOptions::new();
+        let search = text
+            .search(query, &options)
+            .with_context(|| format!("failed to perform search on page {}", page_index))?;
+
+        let page_width = page.width().value;
+        let page_height = page.height().value;
+        if page_width <= 0.0 || page_height <= 0.0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        while let Some(segments) = search.find_next() {
+            let mut rects = Vec::new();
+            for segment in segments.iter() {
+                let bounds = segment.bounds();
+                let left = (bounds.left().value / page_width).clamp(0.0, 1.0);
+                let right = (bounds.right().value / page_width).clamp(0.0, 1.0);
+                let top_ratio = bounds.top().value / page_height;
+                let bottom_ratio = bounds.bottom().value / page_height;
+                let top_norm = (1.0 - top_ratio).clamp(0.0, 1.0);
+                let bottom_norm = (1.0 - bottom_ratio).clamp(0.0, 1.0);
+                let rect = NormalizedRect {
+                    left,
+                    top: top_norm,
+                    right,
+                    bottom: bottom_norm,
+                }
+                .clamp();
+                if rect.is_valid() {
+                    rects.push(rect);
+                }
+            }
+            results.push(rects);
+        }
+
+        Ok(results)
+    }
 }
 
 fn collect_outline(mut bookmark: PdfBookmark<'_>, depth: usize, out: &mut Vec<OutlineItem>) {
@@ -168,13 +239,12 @@ fn collect_outline(mut bookmark: PdfBookmark<'_>, depth: usize, out: &mut Vec<Ou
         if let Some(title) = bookmark.title() {
             if let Some(destination) = bookmark.destination() {
                 if let Ok(page_index) = destination.page_index() {
-                    if let Ok(page_index) = usize::try_from(page_index) {
-                        out.push(OutlineItem {
-                            title,
-                            page_index,
-                            depth,
-                        });
-                    }
+                    let page_index = page_index as usize;
+                    out.push(OutlineItem {
+                        title,
+                        page_index,
+                        depth,
+                    });
                 }
             }
         }

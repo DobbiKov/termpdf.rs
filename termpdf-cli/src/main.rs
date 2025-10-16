@@ -12,7 +12,8 @@ use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
-    Command, DocumentInstance, FileStateStore, OutlineItem, RenderImage, Session, StateStore,
+    Command, DocumentInstance, FileStateStore, NormalizedRect, OutlineItem, RenderImage,
+    SearchHighlights, Session, StateStore,
 };
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent};
@@ -93,7 +94,7 @@ async fn main() -> Result<()> {
             if event_mapper.mode() != InputMode::Toc {
                 event_mapper.set_mode(InputMode::Toc);
             }
-        } else if event_mapper.mode() != InputMode::Normal {
+        } else if matches!(event_mapper.mode(), InputMode::Toc) {
             event_mapper.set_mode(InputMode::Normal);
         }
 
@@ -267,6 +268,21 @@ fn handle_event(
     mapper: &mut EventMapper,
 ) -> Result<LoopAction> {
     match event {
+        UiEvent::BeginSearch => Ok(LoopAction::Continue),
+        UiEvent::SearchQueryChanged { query } => {
+            session.apply(Command::Search { query })?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::SearchSubmit { query } => {
+            session.apply(Command::Search { query })?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::SearchCancel => {
+            session.apply(Command::Search {
+                query: String::new(),
+            })?;
+            Ok(LoopAction::ContinueRedraw)
+        }
         UiEvent::Command(cmd) => {
             let redraw = matches!(
                 cmd,
@@ -278,6 +294,9 @@ fn handle_event(
                     | Command::AdjustViewport { .. }
                     | Command::GotoMark { .. }
                     | Command::ToggleDarkMode
+                    | Command::Search { .. }
+                    | Command::SearchNext { .. }
+                    | Command::SearchPrev { .. }
                     | Command::JumpBackward
                     | Command::JumpForward
                     | Command::SwitchDocument { .. }
@@ -384,7 +403,9 @@ fn redraw(
 
         let base_scale = doc.state.scale;
         let mut render_scale = base_scale;
+        let highlights = doc.search_highlights_for_current_page();
         let mut image = doc.render_with_scale(base_scale)?;
+        let mut highlight_geom = HighlightGeometry::new(image.width, image.height);
 
         let cell_width = if total_cols > 0 {
             pixel_width as f32 / total_cols as f32
@@ -414,12 +435,17 @@ fn redraw(
                     let target_scale = (base_scale * scale_ratio).min(8.0);
                     render_scale = target_scale;
                     image = doc.render_with_scale(target_scale)?;
+                    highlight_geom.set_base(image.width, image.height);
                 }
             }
         }
 
         let zoom_scale = doc.state.scale;
         let mut display_image = image;
+
+        if zoom_scale <= 1.0 {
+            highlight_geom.set_base(display_image.width, display_image.height);
+        }
 
         if zoom_scale > 1.0 {
             let crop_ratio = (1.0 / zoom_scale).min(1.0);
@@ -437,6 +463,7 @@ fn redraw(
                         compute_viewport_origin(display_image.width, crop_width, viewport.x);
                     let offset_y =
                         compute_viewport_origin(display_image.height, crop_height, viewport.y);
+                    highlight_geom.set_crop(offset_x, offset_y, crop_width, crop_height);
                     display_image = crop_render_image(
                         &display_image,
                         offset_x,
@@ -446,6 +473,8 @@ fn redraw(
                     );
                 }
             }
+        } else {
+            highlight_geom.clear_crop();
         }
 
         let effective_pixel_width = if zoom_scale > 1.0 {
@@ -480,6 +509,10 @@ fn redraw(
                 &mut writer,
                 cursor::MoveTo(start_col as u16, start_row as u16)
             )?;
+        }
+
+        if let Some(ref highlights) = highlights {
+            apply_search_highlights(&mut display_image, highlights, &highlight_geom);
         }
 
         renderer.draw(&display_image, DrawParams::clamped(draw_cols, draw_rows))?;
@@ -862,6 +895,171 @@ fn crop_render_image(
     }
 }
 
+struct HighlightGeometry {
+    base_width: u32,
+    base_height: u32,
+    crop: Option<CropRegion>,
+}
+
+impl HighlightGeometry {
+    fn new(base_width: u32, base_height: u32) -> Self {
+        Self {
+            base_width,
+            base_height,
+            crop: None,
+        }
+    }
+
+    fn set_base(&mut self, width: u32, height: u32) {
+        self.base_width = width.max(1);
+        self.base_height = height.max(1);
+    }
+
+    fn set_crop(&mut self, offset_x: u32, offset_y: u32, width: u32, height: u32) {
+        self.crop = Some(CropRegion {
+            offset_x,
+            offset_y,
+            width,
+            height,
+        });
+    }
+
+    fn clear_crop(&mut self) {
+        self.crop = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CropRegion {
+    offset_x: u32,
+    offset_y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PixelRect {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+fn apply_search_highlights(
+    image: &mut RenderImage,
+    highlights: &SearchHighlights,
+    geom: &HighlightGeometry,
+) {
+    if image.width == 0 || image.height == 0 {
+        return;
+    }
+
+    if highlights.is_empty() {
+        return;
+    }
+
+    let other_rects: Vec<PixelRect> = highlights
+        .others
+        .iter()
+        .filter_map(|rect| normalized_to_pixel_rect(*rect, geom))
+        .collect();
+    let current_rects: Vec<PixelRect> = highlights
+        .current
+        .iter()
+        .filter_map(|rect| normalized_to_pixel_rect(*rect, geom))
+        .collect();
+
+    for rect in other_rects {
+        fill_rect(image, rect, [255, 200, 0], 0.2);
+    }
+    for rect in current_rects {
+        fill_rect(image, rect, [255, 235, 0], 0.35);
+    }
+}
+
+fn normalized_to_pixel_rect(rect: NormalizedRect, geom: &HighlightGeometry) -> Option<PixelRect> {
+    let width_f = geom.base_width as f32;
+    let height_f = geom.base_height as f32;
+    if width_f <= 0.0 || height_f <= 0.0 {
+        return None;
+    }
+
+    let mut x0 = (rect.left * width_f).floor() as i32;
+    let mut x1 = (rect.right * width_f).ceil() as i32;
+    let mut y0 = (rect.top * height_f).floor() as i32;
+    let mut y1 = (rect.bottom * height_f).ceil() as i32;
+
+    let max_x = geom.base_width as i32;
+    let max_y = geom.base_height as i32;
+    x0 = x0.clamp(0, max_x);
+    x1 = x1.clamp(0, max_x);
+    y0 = y0.clamp(0, max_y);
+    y1 = y1.clamp(0, max_y);
+
+    if let Some(crop) = &geom.crop {
+        x0 -= crop.offset_x as i32;
+        x1 -= crop.offset_x as i32;
+        y0 -= crop.offset_y as i32;
+        y1 -= crop.offset_y as i32;
+
+        let crop_max_x = crop.width as i32;
+        let crop_max_y = crop.height as i32;
+        x0 = x0.clamp(0, crop_max_x);
+        x1 = x1.clamp(0, crop_max_x);
+        y0 = y0.clamp(0, crop_max_y);
+        y1 = y1.clamp(0, crop_max_y);
+    }
+
+    if x1 - x0 <= 0 || y1 - y0 <= 0 {
+        return None;
+    }
+
+    Some(PixelRect {
+        x0: x0 as u32,
+        y0: y0 as u32,
+        x1: x1 as u32,
+        y1: y1 as u32,
+    })
+}
+
+fn fill_rect(image: &mut RenderImage, rect: PixelRect, color: [u8; 3], alpha: f32) {
+    if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
+        return;
+    }
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let x1 = rect.x1.min(image.width);
+    let y1 = rect.y1.min(image.height);
+    let x0 = rect.x0.min(x1);
+    let y0 = rect.y0.min(y1);
+
+    for y in y0..y1 {
+        let row_start = (y as usize) * width * 4;
+        for x in x0..x1 {
+            let idx = row_start + (x as usize) * 4;
+            blend_pixel(&mut image.pixels[idx..idx + 4], color, alpha);
+        }
+    }
+}
+
+fn blend_pixel(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let inv = 1.0 - alpha;
+    pixel[0] = ((pixel[0] as f32 * inv) + (color[0] as f32 * alpha))
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    pixel[1] = ((pixel[1] as f32 * inv) + (color[1] as f32 * alpha))
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    pixel[2] = ((pixel[2] as f32 * inv) + (color[2] as f32 * alpha))
+        .round()
+        .clamp(0.0, 255.0) as u8;
+}
+
 fn format_document_status(doc: &DocumentInstance) -> String {
     let zoom_percent = doc.state.scale * 100.0;
     let zoom_display = if zoom_percent.is_finite() {
@@ -870,7 +1068,7 @@ fn format_document_status(doc: &DocumentInstance) -> String {
         "—".to_string()
     };
 
-    format!(
+    let mut status = format!(
         "{} — page {}/{} — {}",
         doc.info
             .path
@@ -880,5 +1078,19 @@ fn format_document_status(doc: &DocumentInstance) -> String {
         doc.state.current_page + 1,
         doc.info.page_count,
         zoom_display
-    )
+    );
+
+    if let Some(summary) = doc.search_summary() {
+        status.push_str(" — /");
+        status.push_str(&summary.query);
+        if summary.total == 0 {
+            status.push_str(" (no matches)");
+        } else if let Some(index) = summary.current_index {
+            status.push_str(&format!(" ({}/{})", index + 1, summary.total));
+        } else {
+            status.push_str(&format!(" (0/{})", summary.total));
+        }
+    }
+
+    status
 }
