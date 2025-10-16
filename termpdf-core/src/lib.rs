@@ -46,7 +46,7 @@ pub struct OutlineItem {
     pub depth: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ViewportOffset {
     #[serde(default)]
     pub x: f32,
@@ -145,12 +145,94 @@ impl Default for PersistedDocumentState {
     }
 }
 
+const JUMP_HISTORY_CAPACITY: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DocumentPosition {
+    page: usize,
+    scale: f32,
+    viewport: ViewportOffset,
+}
+
+#[derive(Debug, Default)]
+struct JumpHistory {
+    back_stack: Vec<DocumentPosition>,
+    forward_stack: Vec<DocumentPosition>,
+    last_known: Option<DocumentPosition>,
+}
+
+impl JumpHistory {
+    fn record_initial(&mut self, position: DocumentPosition) {
+        self.last_known = Some(position);
+    }
+
+    fn record_navigation(&mut self, from: DocumentPosition, to: DocumentPosition) {
+        if from == to {
+            return;
+        }
+        self.push_back(from);
+        self.forward_stack.clear();
+        self.last_known = Some(to);
+    }
+
+    fn record_current(&mut self, position: DocumentPosition) {
+        self.last_known = Some(position);
+    }
+
+    fn jump_backward(&mut self, current: DocumentPosition) -> Option<DocumentPosition> {
+        while let Some(target) = self.back_stack.pop() {
+            if target == current {
+                continue;
+            }
+            self.push_forward(current);
+            self.last_known = Some(target);
+            return Some(target);
+        }
+        None
+    }
+
+    fn jump_forward(&mut self, current: DocumentPosition) -> Option<DocumentPosition> {
+        while let Some(target) = self.forward_stack.pop() {
+            if target == current {
+                continue;
+            }
+            self.push_back(current);
+            self.last_known = Some(target);
+            return Some(target);
+        }
+        None
+    }
+
+    fn push_back(&mut self, position: DocumentPosition) {
+        if self.back_stack.last().copied() == Some(position) {
+            return;
+        }
+        self.back_stack.push(position);
+        if self.back_stack.len() > JUMP_HISTORY_CAPACITY {
+            let overflow = self.back_stack.len() - JUMP_HISTORY_CAPACITY;
+            self.back_stack.drain(0..overflow);
+        }
+    }
+
+    fn push_forward(&mut self, position: DocumentPosition) {
+        if self.forward_stack.last().copied() == Some(position) {
+            return;
+        }
+        self.forward_stack.push(position);
+        if self.forward_stack.len() > JUMP_HISTORY_CAPACITY {
+            let overflow = self.forward_stack.len() - JUMP_HISTORY_CAPACITY;
+            self.forward_stack.drain(0..overflow);
+        }
+    }
+}
+
 pub struct DocumentInstance {
     pub info: DocumentInfo,
     pub backend: Arc<dyn DocumentBackend>,
     pub state: PersistedDocumentState,
     render_cache: Mutex<HashMap<CacheKey, RenderImage>>,
     outline: Vec<OutlineItem>,
+    jump_history: JumpHistory,
 }
 
 impl DocumentInstance {
@@ -160,13 +242,17 @@ impl DocumentInstance {
         state: PersistedDocumentState,
         outline: Vec<OutlineItem>,
     ) -> Self {
-        Self {
+        let mut instance = Self {
             info,
             backend,
             state,
             render_cache: Mutex::new(HashMap::new()),
             outline,
-        }
+            jump_history: JumpHistory::default(),
+        };
+        let initial = instance.current_position();
+        instance.jump_history.record_initial(initial);
+        instance
     }
 
     pub fn render(&self) -> Result<RenderImage> {
@@ -249,6 +335,70 @@ impl DocumentInstance {
         Ok(image)
     }
 
+    fn current_position(&self) -> DocumentPosition {
+        DocumentPosition {
+            page: self.state.current_page,
+            scale: self.state.scale,
+            viewport: self.state.viewport,
+        }
+    }
+
+    fn record_jump_from(&mut self, previous: DocumentPosition) {
+        let current = self.current_position();
+        self.jump_history.record_navigation(previous, current);
+    }
+
+    fn sync_jump_position(&mut self) {
+        let current = self.current_position();
+        self.jump_history.record_current(current);
+    }
+
+    fn apply_document_position(&mut self, position: DocumentPosition) -> bool {
+        let mut changed = false;
+        let last_page = self.info.page_count.saturating_sub(1);
+        let target_page = position.page.min(last_page);
+        if target_page != self.state.current_page {
+            self.state.current_page = target_page;
+            changed = true;
+        }
+
+        let target_scale = position.scale.clamp(0.25, 4.0);
+        if (self.state.scale - target_scale).abs() > f32::EPSILON {
+            self.state.scale = target_scale;
+            changed = true;
+        }
+
+        let mut next_viewport = position.viewport;
+        next_viewport.clamp();
+        if (self.state.viewport.x - next_viewport.x).abs() > f32::EPSILON
+            || (self.state.viewport.y - next_viewport.y).abs() > f32::EPSILON
+        {
+            self.state.viewport = next_viewport;
+            changed = true;
+        } else if changed {
+            self.state.viewport = next_viewport;
+        }
+
+        if self.state.scale <= 1.0 + f32::EPSILON {
+            self.state.viewport.reset();
+        } else {
+            self.state.viewport.clamp();
+        }
+
+        self.sync_jump_position();
+        changed
+    }
+
+    fn pop_jump_backward(&mut self) -> Option<DocumentPosition> {
+        let current = self.current_position();
+        self.jump_history.jump_backward(current)
+    }
+
+    fn pop_jump_forward(&mut self) -> Option<DocumentPosition> {
+        let current = self.current_position();
+        self.jump_history.jump_forward(current)
+    }
+
     fn try_get_cached(&self, key: &CacheKey) -> Option<RenderImage> {
         self.render_cache.lock().get(key).cloned()
     }
@@ -319,6 +469,8 @@ pub enum Command {
     SwitchDocument { index: usize },
     CloseDocument { index: usize },
     OpenDocument { path: PathBuf },
+    JumpBackward,
+    JumpForward,
 }
 
 #[derive(Debug, Clone)]
@@ -464,23 +616,17 @@ impl Session {
             }
             Command::GotoMark { key } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
-                    let (target_page, resolved_page) = match doc.get_page_from_mark(key) {
-                        Some(page) => (Some(page), page),
-                        None => (None, 10),
-                    };
-                    if target_page.is_none() {
-                        return Ok(());
-                        // TODO: return
-                        // error
-                    }
-                    let page = resolved_page;
-                    let next = page.min(doc.info.page_count.saturating_sub(1));
-                    if next != doc.state.current_page {
-                        doc.state.current_page = next;
-                        doc.state.viewport.reset();
-                        self.events
-                            .lock()
-                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    if let Some(page) = doc.get_page_from_mark(key) {
+                        let previous = doc.current_position();
+                        let next = page.min(doc.info.page_count.saturating_sub(1));
+                        if next != doc.state.current_page {
+                            doc.state.current_page = next;
+                            doc.state.viewport.reset();
+                            doc.record_jump_from(previous);
+                            self.events
+                                .lock()
+                                .push(SessionEvent::RedrawNeeded(doc.info.id));
+                        }
                     }
                 }
             }
@@ -517,11 +663,18 @@ impl Session {
             }
             Command::NextPage { count } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
+                    let previous = doc.current_position();
                     let next =
                         (doc.state.current_page + count).min(doc.info.page_count.saturating_sub(1));
                     if next != doc.state.current_page {
+                        let diff = previous.page.abs_diff(next);
                         doc.state.current_page = next;
                         doc.state.viewport.reset();
+                        if diff > 1 {
+                            doc.record_jump_from(previous);
+                        } else {
+                            doc.sync_jump_position();
+                        }
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -530,10 +683,17 @@ impl Session {
             }
             Command::PrevPage { count } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
+                    let previous = doc.current_position();
                     let next = doc.state.current_page.saturating_sub(count);
                     if next != doc.state.current_page {
+                        let diff = previous.page.abs_diff(next);
                         doc.state.current_page = next;
                         doc.state.viewport.reset();
+                        if diff > 1 {
+                            doc.record_jump_from(previous);
+                        } else {
+                            doc.sync_jump_position();
+                        }
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -542,10 +702,12 @@ impl Session {
             }
             Command::GotoPage { page } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
+                    let previous = doc.current_position();
                     let next = page.min(doc.info.page_count.saturating_sub(1));
                     if next != doc.state.current_page {
                         doc.state.current_page = next;
                         doc.state.viewport.reset();
+                        doc.record_jump_from(previous);
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -562,6 +724,7 @@ impl Session {
                         } else {
                             doc.state.viewport.clamp();
                         }
+                        doc.sync_jump_position();
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -575,6 +738,7 @@ impl Session {
                         || (doc.state.viewport.y.abs() > f32::EPSILON);
                     doc.state.scale = 1.0;
                     doc.state.viewport.reset();
+                    doc.sync_jump_position();
                     if (prev_scale - 1.0).abs() > f32::EPSILON || viewport_changed {
                         self.events
                             .lock()
@@ -585,6 +749,8 @@ impl Session {
             Command::AdjustViewport { delta_x, delta_y } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     if doc.state.viewport.adjust(delta_x, delta_y) {
+                        doc.state.viewport.clamp();
+                        doc.sync_jump_position();
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -597,6 +763,28 @@ impl Session {
                     self.events
                         .lock()
                         .push(SessionEvent::RedrawNeeded(doc.info.id));
+                }
+            }
+            Command::JumpBackward => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if let Some(position) = doc.pop_jump_backward() {
+                        if doc.apply_document_position(position) {
+                            self.events
+                                .lock()
+                                .push(SessionEvent::RedrawNeeded(doc.info.id));
+                        }
+                    }
+                }
+            }
+            Command::JumpForward => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if let Some(position) = doc.pop_jump_forward() {
+                        if doc.apply_document_position(position) {
+                            self.events
+                                .lock()
+                                .push(SessionEvent::RedrawNeeded(doc.info.id));
+                        }
+                    }
                 }
             }
         }
@@ -704,6 +892,56 @@ mod tests {
         let info = session.active().unwrap().info.clone();
         let stored = store.load(&info).unwrap().unwrap();
         assert_eq!(stored.current_page, 99);
+    }
+
+    #[tokio::test]
+    async fn session_jump_history_tracks_positions() {
+        let store = Arc::new(MemoryStateStore::new());
+        let mut session = Session::new(store);
+        let provider = FakeProvider;
+        session
+            .open_with(&provider, PathBuf::from("/tmp/example.pdf"))
+            .await
+            .unwrap();
+
+        session.apply(Command::NextPage { count: 12 }).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 12);
+
+        session.apply(Command::JumpBackward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 0);
+
+        session.apply(Command::JumpForward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 12);
+
+        session.apply(Command::GotoPage { page: 25 }).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 25);
+
+        session.apply(Command::PrevPage { count: 5 }).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 20);
+
+        session.apply(Command::JumpBackward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 25);
+
+        session.apply(Command::JumpBackward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 12);
+
+        session.apply(Command::JumpBackward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 0);
+
+        session.apply(Command::JumpForward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 12);
+
+        session.apply(Command::JumpForward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 25);
+
+        session.apply(Command::JumpForward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 20);
+
+        session.apply(Command::GotoPage { page: 40 }).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 40);
+
+        session.apply(Command::JumpForward).unwrap();
+        assert_eq!(session.active().unwrap().state.current_page, 40);
     }
 
     #[test]

@@ -293,6 +293,43 @@ mod tests {
     }
 
     #[test]
+    fn event_mapper_maps_ctrl_o_to_jump_backward() {
+        let mut mapper = EventMapper::new();
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )) {
+            UiEvent::Command(Command::JumpBackward) => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_maps_ctrl_i_variants_to_jump_forward() {
+        let mut mapper = EventMapper::new();
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('i'),
+            KeyModifiers::CONTROL,
+        )) {
+            UiEvent::Command(Command::JumpForward) => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Tab,
+            KeyModifiers::CONTROL,
+        )) {
+            UiEvent::Command(Command::JumpForward) => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(KeyCode::Tab, KeyModifiers::NONE)) {
+            UiEvent::Command(Command::JumpForward) => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
     fn event_mapper_toc_mode_maps_navigation_keys() {
         let mut mapper = EventMapper::new();
         mapper.set_mode(InputMode::Toc);
@@ -456,6 +493,23 @@ impl EventMapper {
                 (KeyCode::Char('q'), _) => {
                     self.reset_count();
                     UiEvent::Quit
+                }
+                (KeyCode::Char('o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::JumpBackward)
+                }
+                (KeyCode::Char('i'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::JumpForward)
+                }
+                (KeyCode::Tab, modifiers)
+                    if modifiers.is_empty() || modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::JumpForward)
                 }
                 (KeyCode::Char('+'), _) => {
                     self.reset_count();

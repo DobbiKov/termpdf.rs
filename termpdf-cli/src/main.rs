@@ -278,6 +278,8 @@ fn handle_event(
                     | Command::AdjustViewport { .. }
                     | Command::GotoMark { .. }
                     | Command::ToggleDarkMode
+                    | Command::JumpBackward
+                    | Command::JumpForward
                     | Command::SwitchDocument { .. }
                     | Command::CloseDocument { .. }
             );
