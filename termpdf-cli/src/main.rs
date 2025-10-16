@@ -970,10 +970,11 @@ fn apply_search_highlights(
         .collect();
 
     for rect in other_rects {
-        fill_rect(image, rect, [255, 200, 0], 0.2);
+        stroke_rect(image, rect, [255, 200, 0]);
     }
     for rect in current_rects {
         fill_rect(image, rect, [255, 235, 0], 0.35);
+        stroke_rect(image, rect, [255, 235, 0]);
     }
 }
 
@@ -1058,6 +1059,66 @@ fn blend_pixel(pixel: &mut [u8], color: [u8; 3], alpha: f32) {
     pixel[2] = ((pixel[2] as f32 * inv) + (color[2] as f32 * alpha))
         .round()
         .clamp(0.0, 255.0) as u8;
+}
+
+fn stroke_rect(image: &mut RenderImage, rect: PixelRect, color: [u8; 3]) {
+    if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
+        return;
+    }
+    let width = image.width as usize;
+    if width == 0 {
+        return;
+    }
+    let x0 = rect.x0.min(image.width - 1);
+    let x1 = rect.x1.min(image.width);
+    let y0 = rect.y0.min(image.height - 1);
+    let y1 = rect.y1.min(image.height);
+    let thickness = 2u32;
+
+    for y in y0..y1 {
+        let row_start = (y as usize) * width * 4;
+        for x in x0..(x0 + thickness.min(x1 - x0)) {
+            overwrite_pixel(
+                &mut image.pixels[row_start + (x as usize) * 4..][..4],
+                color,
+            );
+        }
+        if x1 > x0 + thickness {
+            for x in (x1.saturating_sub(thickness))..x1 {
+                overwrite_pixel(
+                    &mut image.pixels[row_start + (x as usize) * 4..][..4],
+                    color,
+                );
+            }
+        }
+    }
+
+    for y in y0..(y0 + thickness.min(y1 - y0)) {
+        let row_start = (y as usize) * width * 4;
+        for x in x0..x1 {
+            overwrite_pixel(
+                &mut image.pixels[row_start + (x as usize) * 4..][..4],
+                color,
+            );
+        }
+    }
+    if y1 > y0 + thickness {
+        for y in (y1.saturating_sub(thickness))..y1 {
+            let row_start = (y as usize) * width * 4;
+            for x in x0..x1 {
+                overwrite_pixel(
+                    &mut image.pixels[row_start + (x as usize) * 4..][..4],
+                    color,
+                );
+            }
+        }
+    }
+}
+
+fn overwrite_pixel(pixel: &mut [u8], color: [u8; 3]) {
+    pixel[0] = color[0];
+    pixel[1] = color[1];
+    pixel[2] = color[2];
 }
 
 fn format_document_status(doc: &DocumentInstance) -> String {
