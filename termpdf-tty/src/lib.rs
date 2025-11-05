@@ -3,7 +3,11 @@ use std::io::{self, Write};
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::{
+    cursor,
+    event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    terminal::{Clear, ClearType},
+};
 use png::{BitDepth, ColorType, Encoder};
 use termpdf_core::{Command, RenderImage};
 
@@ -79,6 +83,29 @@ impl<W: Write> KittyRenderer<W> {
         }
 
         self.writer.flush()?;
+        Ok(())
+    }
+
+    pub fn begin_sync_update(&mut self) -> Result<()> {
+        write!(self.writer, "\u{1b}[?2026h")?;
+        Ok(())
+    }
+
+    /// Disables synchronized updates.
+    /// The terminal will render all buffered changes at once.
+    pub fn end_sync_update(&mut self) -> Result<()> {
+        write!(self.writer, "\u{1b}[?2026l")?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Clears the entire screen.
+    pub fn clear_all(&mut self) -> Result<()> {
+        crossterm::execute!(
+            &mut self.writer,
+            Clear(ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
         Ok(())
     }
 }

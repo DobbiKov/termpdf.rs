@@ -99,15 +99,21 @@ async fn main() -> Result<()> {
         }
 
         if dirty {
-            let pending = event_mapper.pending_input();
+            // Begin an atomic update.
+            renderer.begin_sync_update()?;
+
+            // Perform all drawing operations. The terminal won't show them yet.
             if needs_initial_clear {
-                {
-                    let mut writer = renderer.writer();
-                    crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-                }
+                renderer.clear_all()?;
                 needs_initial_clear = false;
             }
+
+            let pending = event_mapper.pending_input();
             redraw(&mut renderer, &session, pending.as_deref(), &mut overlay)?;
+
+            // End the atomic update. The terminal renders everything at once.
+            renderer.end_sync_update()?;
+
             dirty = false;
         }
 
