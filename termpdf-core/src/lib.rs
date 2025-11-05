@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Error, Result};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{instrument, warn};
+use tracing::{instrument, trace, warn};
 use uuid::Uuid;
 
 pub type DocumentId = Uuid;
@@ -330,6 +330,50 @@ impl DocumentInstance {
             self.state.dark_mode,
             self.state.current_page,
         )
+    }
+
+    pub fn reload(
+        &mut self,
+        info: DocumentInfo,
+        backend: Arc<dyn DocumentBackend>,
+        outline: Vec<OutlineItem>,
+    ) {
+        let previous_query = self.search_state.as_ref().map(|state| state.query.clone());
+
+        self.info = info;
+        self.backend = backend;
+        self.outline = outline;
+
+        self.render_cache.lock().clear();
+        self.text_cache.lock().clear();
+        self.search_state = None;
+
+        if self.info.page_count == 0 {
+            self.state.current_page = 0;
+        } else if self.state.current_page >= self.info.page_count {
+            self.state.current_page = self.info.page_count - 1;
+        }
+        self.state
+            .marks
+            .retain(|_, page| *page < self.info.page_count);
+
+        if self.state.scale <= 1.0 + f32::EPSILON {
+            self.state.viewport.reset();
+        } else {
+            self.state.viewport.clamp();
+        }
+
+        if let Some(query) = previous_query {
+            if let Err(err) = self.perform_search(query) {
+                trace!(
+                    ?err,
+                    path = %self.info.path.display(),
+                    "failed to rebuild search state after reload"
+                );
+            }
+        }
+
+        self.sync_jump_position();
     }
     pub fn add_mark(&mut self, mark: char, page: usize) {
         self.state.marks.insert(mark, page);
@@ -867,6 +911,10 @@ impl Session {
         self.documents.get(self.active)
     }
 
+    pub fn contains_document(&self, doc_id: DocumentId) -> bool {
+        self.documents.iter().any(|doc| doc.info.id == doc_id)
+    }
+
     #[instrument(skip(self, provider))]
     pub async fn open_with<P: DocumentProvider>(
         &mut self,
@@ -897,6 +945,37 @@ impl Session {
             .lock()
             .push(SessionEvent::ActiveDocumentChanged(info.id));
         Ok(())
+    }
+
+    #[instrument(skip(self, provider))]
+    pub async fn reload_document<P: DocumentProvider>(
+        &mut self,
+        provider: &P,
+        doc_id: DocumentId,
+    ) -> Result<bool> {
+        let Some(index) = self.documents.iter().position(|doc| doc.info.id == doc_id) else {
+            return Ok(false);
+        };
+
+        let path = self.documents[index].info.path.clone();
+        let backend = provider.open(&path).await?;
+        let info = backend.info().clone();
+        let outline = match backend.outline() {
+            Ok(outline) => outline,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    path = %info.path.display(),
+                    "failed to reload document outline"
+                );
+                Vec::new()
+            }
+        };
+
+        self.documents[index].reload(info, backend, outline);
+        self.events.lock().push(SessionEvent::RedrawNeeded(doc_id));
+        trace!(doc = %doc_id, "reloaded document after change");
+        Ok(true)
     }
 
     pub fn apply(&mut self, command: Command) -> Result<()> {

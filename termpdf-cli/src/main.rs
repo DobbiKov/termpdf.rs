@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -12,12 +12,12 @@ use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
-    Command, DocumentInstance, FileStateStore, NormalizedRect, OutlineItem, RenderImage,
-    SearchHighlights, Session, StateStore,
+    Command, DocumentId, DocumentInstance, FileStateStore, NormalizedRect, OutlineItem,
+    RenderImage, SearchHighlights, Session, StateStore,
 };
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent};
-use tracing::warn;
+use tracing::{trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -35,6 +35,39 @@ struct Args {
     /// Paths to PDF files to open
     #[arg(required = true)]
     files: Vec<PathBuf>,
+}
+
+const FILE_POLL_INTERVAL_MS: u64 = 300;
+
+struct WatchedDocument {
+    id: DocumentId,
+    path: PathBuf,
+    last_modified: Option<SystemTime>,
+    last_checked: Instant,
+}
+
+impl WatchedDocument {
+    fn new(id: DocumentId, path: PathBuf) -> Self {
+        let last_modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        Self {
+            id,
+            path,
+            last_modified,
+            last_checked: Instant::now(),
+        }
+    }
+
+    fn should_check(&self, interval: Duration) -> bool {
+        self.last_checked.elapsed() >= interval
+    }
+
+    fn mark_checked(&mut self) {
+        self.last_checked = Instant::now();
+    }
+
+    fn update_snapshot(&mut self, modified: Option<SystemTime>) {
+        self.last_modified = modified;
+    }
 }
 
 struct RawModeGuard;
@@ -67,6 +100,7 @@ async fn main() -> Result<()> {
     let state_dir = project_dirs.data_local_dir().join("state");
     let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(state_dir.clone())?);
     let mut session = Session::new(store);
+    let mut watched_docs = Vec::new();
 
     let provider = PdfRenderFactory::new()?;
     for path in &args.files {
@@ -74,6 +108,15 @@ async fn main() -> Result<()> {
             .open_with(&provider, path.clone())
             .await
             .with_context(|| format!("failed to open {:?}", path))?;
+
+        if let Some(doc) = session.active() {
+            if !watched_docs
+                .iter()
+                .any(|entry: &WatchedDocument| entry.id == doc.info.id)
+            {
+                watched_docs.push(WatchedDocument::new(doc.info.id, doc.info.path.clone()));
+            }
+        }
     }
 
     if let Some(page) = args.page {
@@ -88,6 +131,7 @@ async fn main() -> Result<()> {
     let mut overlay = OverlayState::None;
     let mut dirty = true;
     let mut needs_initial_clear = true;
+    let file_poll_interval = Duration::from_millis(FILE_POLL_INTERVAL_MS);
 
     loop {
         if overlay.is_active() {
@@ -96,6 +140,63 @@ async fn main() -> Result<()> {
             }
         } else if matches!(event_mapper.mode(), InputMode::Toc) {
             event_mapper.set_mode(InputMode::Normal);
+        }
+
+        let mut reload_queue = Vec::new();
+        for watched in watched_docs.iter_mut() {
+            if !watched.should_check(file_poll_interval) {
+                continue;
+            }
+            watched.mark_checked();
+            let modified = match fs::metadata(&watched.path)
+                .and_then(|meta| meta.modified())
+                .ok()
+            {
+                Some(ts) => ts,
+                None => continue,
+            };
+            if watched
+                .last_modified
+                .map(|prev| prev == modified)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            reload_queue.push((watched.id, modified));
+        }
+
+        for (doc_id, modified) in reload_queue {
+            match session.reload_document(&provider, doc_id).await {
+                Ok(true) => {
+                    {
+                        if let Some(entry) =
+                            watched_docs.iter_mut().find(|entry| entry.id == doc_id)
+                        {
+                            entry.update_snapshot(Some(modified));
+                        }
+                    }
+                    if let Some(active) = session.active() {
+                        if active.info.id == doc_id {
+                            if let OverlayState::Toc(toc) = &mut overlay {
+                                toc.entries = active.outline().to_vec();
+                                toc.update_selection_for_page(active.state.current_page);
+                            }
+                            needs_initial_clear = true;
+                            dirty = true;
+                        }
+                    }
+                }
+                Ok(false) => {
+                    watched_docs.retain(|entry| entry.id != doc_id);
+                }
+                Err(err) => {
+                    trace!(
+                        ?err,
+                        doc = %doc_id,
+                        "failed to reload document after change"
+                    );
+                }
+            }
         }
 
         if dirty {
@@ -133,6 +234,7 @@ async fn main() -> Result<()> {
                 LoopAction::Continue => {}
                 LoopAction::Quit => break,
             }
+            watched_docs.retain(|entry| session.contains_document(entry.id));
             if overlay.is_active() != overlay_was_active {
                 needs_initial_clear = true;
                 dirty = true;
