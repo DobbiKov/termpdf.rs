@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -12,14 +14,15 @@ use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
-    Command, DocumentId, DocumentInstance, FileStateStore, NormalizedRect, OutlineItem,
-    RenderImage, SearchHighlights, Session, StateStore,
+    Command, DocumentId, DocumentInstance, ExternalLink, FileStateStore, Highlights, LinkSummary,
+    NormalizedRect, OutlineItem, RenderImage, Session, SessionEvent, StateStore,
 };
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent};
 use tracing::{trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{prelude::*, EnvFilter};
+use url::Url;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +41,11 @@ struct Args {
 }
 
 const FILE_POLL_INTERVAL_MS: u64 = 300;
+
+#[cfg(target_os = "macos")]
+const OPEN_COMMAND: &str = "open";
+#[cfg(all(unix, not(target_os = "macos")))]
+const OPEN_COMMAND: &str = "xdg-open";
 
 struct WatchedDocument {
     id: DocumentId,
@@ -197,6 +205,10 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+        }
+
+        if process_session_events(&session) {
+            dirty = true;
         }
 
         if dirty {
@@ -379,20 +391,23 @@ fn handle_event(
         UiEvent::BeginSearch => Ok(LoopAction::Continue),
         UiEvent::SearchQueryChanged { query } => {
             session.apply(Command::Search { query })?;
+            let _ = process_session_events(session);
             Ok(LoopAction::ContinueRedraw)
         }
         UiEvent::SearchSubmit { query } => {
             session.apply(Command::Search { query })?;
+            let _ = process_session_events(session);
             Ok(LoopAction::ContinueRedraw)
         }
         UiEvent::SearchCancel => {
             session.apply(Command::Search {
                 query: String::new(),
             })?;
+            let _ = process_session_events(session);
             Ok(LoopAction::ContinueRedraw)
         }
         UiEvent::Command(cmd) => {
-            let redraw = matches!(
+            let mut redraw = matches!(
                 cmd,
                 Command::GotoPage { .. }
                     | Command::NextPage { .. }
@@ -405,6 +420,11 @@ fn handle_event(
                     | Command::Search { .. }
                     | Command::SearchNext { .. }
                     | Command::SearchPrev { .. }
+                    | Command::EnterLinkMode
+                    | Command::LeaveLinkMode
+                    | Command::LinkNext { .. }
+                    | Command::LinkPrev { .. }
+                    | Command::ActivateLink
                     | Command::JumpBackward
                     | Command::JumpForward
                     | Command::SwitchDocument { .. }
@@ -416,6 +436,8 @@ fn handle_event(
             );
 
             session.apply(cmd)?;
+            let event_redraw = process_session_events(session);
+            redraw = redraw || event_redraw;
 
             if resets_overlay {
                 overlay.deactivate();
@@ -469,6 +491,7 @@ fn handle_event(
                     session.apply(Command::GotoPage {
                         page: entry.page_index,
                     })?;
+                    let _ = process_session_events(session);
                     overlay.deactivate();
                     mapper.set_mode(InputMode::Normal);
                     return Ok(LoopAction::ContinueRedraw);
@@ -479,6 +502,24 @@ fn handle_event(
         UiEvent::Quit => Ok(LoopAction::Quit),
         UiEvent::None => Ok(LoopAction::Continue),
     }
+}
+
+fn process_session_events(session: &Session) -> bool {
+    let mut redraw = false;
+    for event in session.drain_events() {
+        match event {
+            SessionEvent::RedrawNeeded(_) => redraw = true,
+            SessionEvent::FollowExternalLink { target } => {
+                if let Err(err) = open_external_link(&target) {
+                    warn!(?err, "failed to open external link");
+                }
+            }
+            SessionEvent::DocumentOpened(_)
+            | SessionEvent::DocumentClosed(_)
+            | SessionEvent::ActiveDocumentChanged(_) => {}
+        }
+    }
+    redraw
 }
 
 fn redraw(
@@ -511,7 +552,8 @@ fn redraw(
 
         let base_scale = doc.state.scale;
         let mut render_scale = base_scale;
-        let highlights = doc.search_highlights_for_current_page();
+        let search_highlights = doc.search_highlights_for_current_page();
+        let link_highlights = doc.link_highlights_for_current_page();
         let mut image = doc.render_with_scale(base_scale)?;
         let mut highlight_geom = HighlightGeometry::new(image.width, image.height);
 
@@ -619,8 +661,8 @@ fn redraw(
             )?;
         }
 
-        if let Some(ref highlights) = highlights {
-            apply_search_highlights(&mut display_image, highlights, &highlight_geom);
+        if let Some(highlights) = link_highlights.as_ref().or(search_highlights.as_ref()) {
+            apply_highlights(&mut display_image, highlights, &highlight_geom);
         }
 
         renderer.draw(&display_image, DrawParams::clamped(draw_cols, draw_rows))?;
@@ -1053,11 +1095,7 @@ struct PixelRect {
     y1: u32,
 }
 
-fn apply_search_highlights(
-    image: &mut RenderImage,
-    highlights: &SearchHighlights,
-    geom: &HighlightGeometry,
-) {
+fn apply_highlights(image: &mut RenderImage, highlights: &Highlights, geom: &HighlightGeometry) {
     if image.width == 0 || image.height == 0 {
         return;
     }
@@ -1083,6 +1121,66 @@ fn apply_search_highlights(
     for rect in current_rects {
         fill_rect(image, rect, [255, 235, 0], 0.35);
         stroke_rect(image, rect, [255, 235, 0]);
+    }
+}
+
+fn open_external_link(target: &ExternalLink) -> Result<()> {
+    match target {
+        ExternalLink::Url(uri) => open_uri(uri),
+        ExternalLink::File(path) => open_path(path),
+    }
+}
+
+fn open_uri(uri: &str) -> Result<()> {
+    if let Ok(url) = Url::parse(uri) {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return open_path(&path);
+            }
+        }
+    }
+    spawn_open_command(OsStr::new(uri))
+}
+
+fn open_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!("link target {:?} does not exist", path));
+    }
+    spawn_open_command(path.as_os_str())
+}
+
+fn spawn_open_command(target: &OsStr) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let status = ProcessCommand::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(target)
+            .status()
+            .with_context(|| format!("failed to spawn open command for {:?}", target))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "open command exited with status {:?}",
+                status.code()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let status = ProcessCommand::new(OPEN_COMMAND)
+            .arg(target)
+            .status()
+            .with_context(|| format!("failed to spawn '{}' for {:?}", OPEN_COMMAND, target))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "'{}' exited with status {:?}",
+                OPEN_COMMAND,
+                status.code()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1254,6 +1352,17 @@ fn format_document_status(doc: &DocumentInstance) -> String {
         status.push_str(&summary.query);
         if summary.total == 0 {
             status.push_str(" (no matches)");
+        } else if let Some(index) = summary.current_index {
+            status.push_str(&format!(" ({}/{})", index + 1, summary.total));
+        } else {
+            status.push_str(&format!(" (0/{})", summary.total));
+        }
+    }
+
+    if let Some(summary) = doc.link_summary() {
+        status.push_str(" — link");
+        if summary.total == 0 {
+            status.push_str(" (no links)");
         } else if let Some(index) = summary.current_index {
             status.push_str(&format!(" ({}/{})", index + 1, summary.total));
         } else {

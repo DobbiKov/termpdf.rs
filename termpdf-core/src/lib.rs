@@ -246,6 +246,39 @@ pub struct SearchSummary {
     pub current_index: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LinkDefinition {
+    pub rects: Vec<NormalizedRect>,
+    pub action: LinkAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkAction {
+    GoTo { page: usize },
+    Uri { uri: String },
+    Unsupported,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkSummary {
+    pub total: usize,
+    pub current_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExternalLink {
+    Url(String),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkFollowResult {
+    Navigated { page_changed: bool },
+    External { target: ExternalLink },
+    Unsupported,
+    NoActiveLink,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NormalizedRect {
     pub left: f32,
@@ -269,21 +302,37 @@ impl NormalizedRect {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SearchHighlights {
+pub struct Highlights {
     pub current: Vec<NormalizedRect>,
     pub others: Vec<NormalizedRect>,
 }
 
-impl SearchHighlights {
+impl Highlights {
     pub fn is_empty(&self) -> bool {
         self.current.is_empty() && self.others.is_empty()
     }
 }
 
+pub type SearchHighlights = Highlights;
+pub type LinkHighlights = Highlights;
+
 #[derive(Copy, Clone)]
 enum SearchDirection {
     Forward,
     Backward,
+}
+
+#[derive(Debug, Clone)]
+struct LinkEntry {
+    page: usize,
+    rects: Vec<NormalizedRect>,
+    action: LinkAction,
+}
+
+#[derive(Debug, Clone)]
+struct LinkState {
+    links: Vec<LinkEntry>,
+    current_index: Option<usize>,
 }
 
 pub struct DocumentInstance {
@@ -295,6 +344,7 @@ pub struct DocumentInstance {
     jump_history: JumpHistory,
     text_cache: Mutex<HashMap<usize, Arc<String>>>,
     search_state: Option<SearchState>,
+    link_state: Option<LinkState>,
 }
 
 impl DocumentInstance {
@@ -313,6 +363,7 @@ impl DocumentInstance {
             jump_history: JumpHistory::default(),
             text_cache: Mutex::new(HashMap::new()),
             search_state: None,
+            link_state: None,
         };
         let initial = instance.current_position();
         instance.jump_history.record_initial(initial);
@@ -347,6 +398,7 @@ impl DocumentInstance {
         self.render_cache.lock().clear();
         self.text_cache.lock().clear();
         self.search_state = None;
+        self.link_state = None;
 
         if self.info.page_count == 0 {
             self.state.current_page = 0;
@@ -727,6 +779,176 @@ impl DocumentInstance {
         }
     }
 
+    pub fn start_link_mode(&mut self) -> Result<()> {
+        let entries = self.build_link_entries()?;
+        let current_page = self.state.current_page;
+        let current_index = entries.iter().position(|link| link.page == current_page);
+        self.link_state = Some(LinkState {
+            links: entries,
+            current_index,
+        });
+        Ok(())
+    }
+
+    pub fn clear_link_state(&mut self) {
+        self.link_state = None;
+    }
+
+    pub fn next_link(&mut self, count: usize) -> Option<bool> {
+        self.advance_link(SearchDirection::Forward, count)
+    }
+
+    pub fn previous_link(&mut self, count: usize) -> Option<bool> {
+        self.advance_link(SearchDirection::Backward, count)
+    }
+
+    fn advance_link(&mut self, direction: SearchDirection, count: usize) -> Option<bool> {
+        if count == 0 {
+            return Some(false);
+        }
+
+        let Some(state) = self.link_state.as_mut() else {
+            return None;
+        };
+
+        if state.links.is_empty() {
+            return Some(false);
+        }
+
+        let total = state.links.len();
+        let current = state
+            .current_index
+            .unwrap_or(0)
+            .min(total.saturating_sub(1));
+        let steps = count % total;
+        if steps == 0 {
+            return Some(self.apply_link_index(current));
+        }
+
+        let target = match direction {
+            SearchDirection::Forward => (current + steps) % total,
+            SearchDirection::Backward => (current + total - steps) % total,
+        };
+
+        Some(self.apply_link_index(target))
+    }
+
+    fn apply_link_index(&mut self, index: usize) -> bool {
+        let Some(state) = self.link_state.as_mut() else {
+            return false;
+        };
+
+        if state.links.is_empty() || index >= state.links.len() {
+            state.current_index = None;
+            return false;
+        }
+
+        state.current_index = Some(index);
+        let link = &state.links[index];
+        let target_page = link.page.min(self.info.page_count.saturating_sub(1));
+        let previous = self.current_position();
+        let changed = if target_page != self.state.current_page {
+            self.state.current_page = target_page;
+            self.state.viewport.reset();
+            self.record_jump_from(previous);
+            true
+        } else {
+            false
+        };
+        self.sync_jump_position();
+        changed
+    }
+
+    pub fn link_summary(&self) -> Option<LinkSummary> {
+        self.link_state.as_ref().map(|state| LinkSummary {
+            total: state.links.len(),
+            current_index: state.current_index,
+        })
+    }
+
+    pub fn link_highlights_for_current_page(&self) -> Option<LinkHighlights> {
+        let state = self.link_state.as_ref()?;
+        let current_page = self.state.current_page;
+        let mut highlights = LinkHighlights::default();
+
+        for (idx, link) in state.links.iter().enumerate() {
+            if link.page != current_page {
+                continue;
+            }
+            if Some(idx) == state.current_index {
+                highlights.current.extend(link.rects.iter().copied());
+            } else {
+                highlights.others.extend(link.rects.iter().copied());
+            }
+        }
+
+        if highlights.is_empty() {
+            None
+        } else {
+            Some(highlights)
+        }
+    }
+
+    pub fn activate_link(&mut self) -> LinkFollowResult {
+        let Some(state) = self.link_state.as_ref() else {
+            return LinkFollowResult::NoActiveLink;
+        };
+        let Some(index) = state.current_index else {
+            return LinkFollowResult::NoActiveLink;
+        };
+        let Some(link) = state.links.get(index) else {
+            return LinkFollowResult::NoActiveLink;
+        };
+
+        match &link.action {
+            LinkAction::GoTo { page } => {
+                let target_page = (*page).min(self.info.page_count.saturating_sub(1));
+                let previous = self.current_position();
+                let page_changed = if target_page != self.state.current_page {
+                    self.state.current_page = target_page;
+                    self.state.viewport.reset();
+                    self.record_jump_from(previous);
+                    true
+                } else {
+                    false
+                };
+                self.sync_jump_position();
+                LinkFollowResult::Navigated { page_changed }
+            }
+            LinkAction::Uri { uri } => LinkFollowResult::External {
+                target: ExternalLink::Url(uri.clone()),
+            },
+            LinkAction::Unsupported => LinkFollowResult::Unsupported,
+        }
+    }
+
+    fn build_link_entries(&self) -> Result<Vec<LinkEntry>> {
+        let mut entries = Vec::new();
+        for page in 0..self.info.page_count {
+            let definitions = self.backend.page_links(page)?;
+            if definitions.is_empty() {
+                continue;
+            }
+            for definition in definitions {
+                let rects: Vec<NormalizedRect> = definition
+                    .rects
+                    .into_iter()
+                    .map(|rect| rect.clamp())
+                    .filter(|rect| rect.is_valid())
+                    .collect();
+                if rects.is_empty() {
+                    continue;
+                }
+                entries.push(LinkEntry {
+                    page,
+                    rects,
+                    action: definition.action,
+                });
+            }
+        }
+        Ok(entries)
+    }
+
     fn try_get_cached(&self, key: &CacheKey) -> Option<RenderImage> {
         self.render_cache.lock().get(key).cloned()
     }
@@ -796,6 +1018,11 @@ pub enum Command {
     Search { query: String },
     SearchNext { count: usize },
     SearchPrev { count: usize },
+    EnterLinkMode,
+    LeaveLinkMode,
+    LinkNext { count: usize },
+    LinkPrev { count: usize },
+    ActivateLink,
     ToggleDarkMode,
     SwitchDocument { index: usize },
     CloseDocument { index: usize },
@@ -810,6 +1037,7 @@ pub enum SessionEvent {
     DocumentClosed(DocumentId),
     ActiveDocumentChanged(DocumentId),
     RedrawNeeded(DocumentId),
+    FollowExternalLink { target: ExternalLink },
 }
 
 pub trait DocumentBackend: Send + Sync {
@@ -822,6 +1050,9 @@ pub trait DocumentBackend: Send + Sync {
         Err(anyhow!("text extraction not supported"))
     }
     fn search_page(&self, _page_index: usize, _query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
+        Ok(Vec::new())
+    }
+    fn page_links(&self, _page_index: usize) -> Result<Vec<LinkDefinition>> {
         Ok(Vec::new())
     }
 }
@@ -905,6 +1136,11 @@ impl Session {
 
     pub fn events(&self) -> Arc<Mutex<Vec<SessionEvent>>> {
         Arc::clone(&self.events)
+    }
+
+    pub fn drain_events(&self) -> Vec<SessionEvent> {
+        let mut events = self.events.lock();
+        events.drain(..).collect()
     }
 
     pub fn active(&self) -> Option<&DocumentInstance> {
@@ -1025,6 +1261,57 @@ impl Session {
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::EnterLinkMode => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    doc.start_link_mode()?;
+                    self.events
+                        .lock()
+                        .push(SessionEvent::RedrawNeeded(doc.info.id));
+                }
+            }
+            Command::LeaveLinkMode => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    doc.clear_link_state();
+                    self.events
+                        .lock()
+                        .push(SessionEvent::RedrawNeeded(doc.info.id));
+                }
+            }
+            Command::LinkNext { count } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.next_link(count.max(1)).is_some() {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::LinkPrev { count } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.previous_link(count.max(1)).is_some() {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::ActivateLink => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    match doc.activate_link() {
+                        LinkFollowResult::Navigated { .. } => {
+                            self.events
+                                .lock()
+                                .push(SessionEvent::RedrawNeeded(doc.info.id));
+                        }
+                        LinkFollowResult::External { target } => {
+                            let mut events = self.events.lock();
+                            events.push(SessionEvent::RedrawNeeded(doc.info.id));
+                            events.push(SessionEvent::FollowExternalLink { target });
+                        }
+                        LinkFollowResult::Unsupported | LinkFollowResult::NoActiveLink => {}
                     }
                 }
             }
@@ -1271,6 +1558,10 @@ mod tests {
                 Ok(Vec::new())
             }
         }
+
+        fn page_links(&self, _page_index: usize) -> Result<Vec<LinkDefinition>> {
+            Ok(Vec::new())
+        }
     }
 
     struct FakeProvider;
@@ -1434,6 +1725,116 @@ mod tests {
             assert_eq!(summary.total, 0);
             assert!(summary.current_index.is_none());
             assert!(doc.search_highlights_for_current_page().is_none());
+        }
+    }
+
+    struct LinkBackend {
+        info: DocumentInfo,
+        links: Vec<Vec<LinkDefinition>>,
+    }
+
+    impl LinkBackend {
+        fn new(info: DocumentInfo, links: Vec<Vec<LinkDefinition>>) -> Self {
+            Self { info, links }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DocumentBackend for LinkBackend {
+        fn info(&self) -> &DocumentInfo {
+            &self.info
+        }
+
+        fn render_page(&self, _request: RenderRequest) -> Result<RenderImage> {
+            Ok(RenderImage {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 0, 0],
+            })
+        }
+
+        fn page_text(&self, _page_index: usize) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn search_page(
+            &self,
+            _page_index: usize,
+            _query: &str,
+        ) -> Result<Vec<Vec<NormalizedRect>>> {
+            Ok(Vec::new())
+        }
+
+        fn page_links(&self, page_index: usize) -> Result<Vec<LinkDefinition>> {
+            Ok(self.links.get(page_index).cloned().unwrap_or_default())
+        }
+    }
+
+    #[test]
+    fn link_mode_navigation_and_activation() {
+        let path = PathBuf::from("/tmp/link-test.pdf");
+        let info = DocumentInfo {
+            id: document_id_for_path(&path),
+            path,
+            page_count: 3,
+            metadata: DocumentMetadata::default(),
+        };
+
+        let links = vec![
+            vec![LinkDefinition {
+                rects: vec![NormalizedRect {
+                    left: 0.1,
+                    top: 0.1,
+                    right: 0.3,
+                    bottom: 0.2,
+                }],
+                action: LinkAction::GoTo { page: 1 },
+            }],
+            vec![LinkDefinition {
+                rects: vec![NormalizedRect {
+                    left: 0.2,
+                    top: 0.2,
+                    right: 0.4,
+                    bottom: 0.3,
+                }],
+                action: LinkAction::Uri {
+                    uri: "https://example.com".to_string(),
+                },
+            }],
+            Vec::new(),
+        ];
+
+        let backend = Arc::new(LinkBackend::new(info.clone(), links));
+        let mut instance =
+            DocumentInstance::new(info, backend, PersistedDocumentState::default(), Vec::new());
+
+        assert!(instance.link_summary().is_none());
+
+        instance.start_link_mode().expect("link mode");
+
+        let summary = instance.link_summary().expect("link summary present");
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.current_index, Some(0));
+
+        let highlights = instance
+            .link_highlights_for_current_page()
+            .expect("highlights on current page");
+        assert!(!highlights.current.is_empty());
+
+        match instance.activate_link() {
+            LinkFollowResult::Navigated { page_changed } => assert!(page_changed),
+            other => panic!("unexpected activation result: {:?}", other),
+        }
+        assert_eq!(instance.state.current_page, 1);
+
+        assert!(instance.next_link(1).is_some());
+
+        match instance.activate_link() {
+            LinkFollowResult::External { target } => match target {
+                ExternalLink::Url(url) => assert_eq!(url, "https://example.com"),
+                other => panic!("unexpected external target: {:?}", other),
+            },
+            other => panic!("unexpected activation result: {:?}", other),
         }
     }
 

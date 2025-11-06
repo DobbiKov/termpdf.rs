@@ -301,7 +301,10 @@ mod tests {
             mapper.map_event(key_event(KeyCode::Char('3'))),
             UiEvent::None
         ));
-        match mapper.map_event(key_event(KeyCode::Char('l'))) {
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('L'),
+            KeyModifiers::SHIFT,
+        )) {
             UiEvent::Command(Command::AdjustViewport { delta_x, delta_y }) => {
                 assert!((delta_x - 3.0 * EventMapper::PAN_STEP).abs() < f32::EPSILON);
                 assert_eq!(delta_y, 0.0);
@@ -419,6 +422,62 @@ mod tests {
     }
 
     #[test]
+    fn event_mapper_l_enters_link_mode() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('l'))),
+            UiEvent::Command(Command::EnterLinkMode)
+        ));
+        assert_eq!(mapper.mode(), InputMode::Link);
+        assert_eq!(mapper.pending_input().as_deref(), Some("link"));
+    }
+
+    #[test]
+    fn event_mapper_link_mode_accepts_prefix_for_navigation() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Link);
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('3'))),
+            UiEvent::None
+        ));
+        match mapper.map_event(key_event(KeyCode::Char('n'))) {
+            UiEvent::Command(Command::LinkNext { count }) => assert_eq!(count, 3),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_link_mode_supports_previous_navigation() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Link);
+        match mapper.map_event(key_event(KeyCode::Char('N'))) {
+            UiEvent::Command(Command::LinkPrev { count }) => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_link_mode_follows_active_link() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Link);
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('g'))),
+            UiEvent::Command(Command::ActivateLink)
+        ));
+    }
+
+    #[test]
+    fn event_mapper_link_mode_exit_on_escape() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Link);
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Esc)),
+            UiEvent::Command(Command::LeaveLinkMode)
+        ));
+        assert_eq!(mapper.mode(), InputMode::Normal);
+    }
+
+    #[test]
     fn event_mapper_toc_mode_maps_navigation_keys() {
         let mut mapper = EventMapper::new();
         mapper.set_mode(InputMode::Toc);
@@ -489,6 +548,7 @@ pub enum InputMode {
     Normal,
     Toc,
     Search,
+    Link,
 }
 
 impl Default for InputMode {
@@ -536,6 +596,7 @@ impl EventMapper {
             InputMode::Normal => self.map_event_normal(event),
             InputMode::Toc => self.map_event_toc(event),
             InputMode::Search => self.map_event_search(event),
+            InputMode::Link => self.map_event_link(event),
         }
     }
 
@@ -589,8 +650,7 @@ impl EventMapper {
                 }
                 (KeyCode::Char('H'), KeyModifiers::SHIFT)
                 | (KeyCode::Char('h'), KeyModifiers::NONE) => self.pan(-Self::PAN_STEP, 0.0),
-                (KeyCode::Char('L'), KeyModifiers::SHIFT)
-                | (KeyCode::Char('l'), KeyModifiers::NONE) => self.pan(Self::PAN_STEP, 0.0),
+                (KeyCode::Char('L'), KeyModifiers::SHIFT) => self.pan(Self::PAN_STEP, 0.0),
                 (KeyCode::Char('K'), KeyModifiers::SHIFT) => self.pan(0.0, -Self::PAN_STEP),
                 (KeyCode::Char('J'), KeyModifiers::SHIFT) => self.pan(0.0, Self::PAN_STEP),
                 (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
@@ -604,6 +664,10 @@ impl EventMapper {
                 (KeyCode::Char('/'), KeyModifiers::NONE) => {
                     self.start_search();
                     UiEvent::BeginSearch
+                }
+                (KeyCode::Char('l'), KeyModifiers::NONE) => {
+                    self.start_link_mode();
+                    UiEvent::Command(Command::EnterLinkMode)
                 }
                 (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     let count = self.take_count();
@@ -723,6 +787,47 @@ impl EventMapper {
         }
     }
 
+    fn map_event_link(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.set_mode(InputMode::Normal);
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::LeaveLinkMode)
+                }
+                (KeyCode::Char(c), KeyModifiers::NONE) if c.is_ascii_digit() => {
+                    if let Some(digit) = c.to_digit(10) {
+                        self.push_digit(digit as usize);
+                    }
+                    UiEvent::None
+                }
+                (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                    let count = self.take_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::LinkNext { count })
+                }
+                (KeyCode::Char('N'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    let count = self.take_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::LinkPrev { count })
+                }
+                (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    UiEvent::Command(Command::ActivateLink)
+                }
+                _ => {
+                    self.reset_count();
+                    UiEvent::None
+                }
+            },
+            _ => UiEvent::None,
+        }
+    }
+
     fn push_digit(&mut self, digit: usize) {
         let current = self.pending_count.unwrap_or(0);
         let next = current.saturating_mul(10).saturating_add(digit);
@@ -758,6 +863,10 @@ impl EventMapper {
         self.set_mode(InputMode::Search);
     }
 
+    fn start_link_mode(&mut self) {
+        self.set_mode(InputMode::Link);
+    }
+
     fn pan(&mut self, delta_x: f32, delta_y: f32) -> UiEvent {
         let multiplier = self.take_count() as f32;
         self.reset_char_stack();
@@ -770,6 +879,14 @@ impl EventMapper {
     pub fn pending_input(&self) -> Option<String> {
         if matches!(self.mode, InputMode::Search) {
             return Some(format!("/{}", self.search_buffer));
+        }
+        if matches!(self.mode, InputMode::Link) {
+            let mut label = String::from("link");
+            if !self.pending_digits.is_empty() {
+                label.push(' ');
+                label.push_str(&self.pending_digits);
+            }
+            return Some(label);
         }
         let mut pending = String::new();
         if !self.pending_digits.is_empty() {

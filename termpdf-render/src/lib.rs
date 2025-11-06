@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use pdfium_render::prelude::*;
 use termpdf_core::{
     document_id_for_path, DocumentBackend, DocumentInfo, DocumentMetadata, DocumentProvider,
-    NormalizedRect, OutlineItem, RenderImage, RenderRequest,
+    LinkAction, LinkDefinition, NormalizedRect, OutlineItem, RenderImage, RenderRequest,
 };
 use tracing::{instrument, warn};
 
@@ -105,6 +105,44 @@ impl PdfiumDocument {
             height: u32::try_from(bitmap.height()).unwrap_or_default(),
             pixels,
         })
+    }
+
+    fn link_action_from_pdfium(&self, link: &PdfLink<'_>) -> Option<LinkAction> {
+        if let Some(action) = link.action() {
+            match action.action_type() {
+                PdfActionType::GoToDestinationInSameDocument => {
+                    if let Some(local) = action.as_local_destination_action() {
+                        if let Ok(destination) = local.destination() {
+                            if let Ok(page_index) = destination.page_index() {
+                                return Some(LinkAction::GoTo {
+                                    page: page_index as usize,
+                                });
+                            }
+                        }
+                    }
+                }
+                PdfActionType::Uri => {
+                    if let Some(uri_action) = action.as_uri_action() {
+                        if let Ok(uri) = uri_action.uri() {
+                            if !uri.is_empty() {
+                                return Some(LinkAction::Uri { uri });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(destination) = link.destination() {
+            if let Ok(page_index) = destination.page_index() {
+                return Some(LinkAction::GoTo {
+                    page: page_index as usize,
+                });
+            }
+        }
+
+        None
     }
 }
 
@@ -231,6 +269,69 @@ impl DocumentBackend for PdfiumDocument {
         }
 
         Ok(results)
+    }
+
+    fn page_links(&self, page_index: usize) -> Result<Vec<LinkDefinition>> {
+        let document = self.load_document()?;
+        let page_index: PdfPageIndex = page_index
+            .try_into()
+            .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
+        let page = document
+            .pages()
+            .get(page_index)
+            .with_context(|| format!("page {} out of range", page_index))?;
+
+        let page_width = page.width().value;
+        let page_height = page.height().value;
+        if page_width <= 0.0 || page_height <= 0.0 {
+            return Ok(Vec::new());
+        }
+
+        let mut definitions = Vec::new();
+        let links = page.links();
+        for link in links.iter() {
+            let rect = match link.rect() {
+                Ok(rect) => rect,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        page = page_index as usize,
+                        path = %self.path.display(),
+                        "failed to resolve link rectangle"
+                    );
+                    continue;
+                }
+            };
+
+            let left = (rect.left().value / page_width).clamp(0.0, 1.0);
+            let right = (rect.right().value / page_width).clamp(0.0, 1.0);
+            let top_ratio = rect.top().value / page_height;
+            let bottom_ratio = rect.bottom().value / page_height;
+            let top = (1.0 - top_ratio).clamp(0.0, 1.0);
+            let bottom = (1.0 - bottom_ratio).clamp(0.0, 1.0);
+            let rect = NormalizedRect {
+                left,
+                top,
+                right,
+                bottom,
+            }
+            .clamp();
+
+            if !rect.is_valid() {
+                continue;
+            }
+
+            let Some(action) = self.link_action_from_pdfium(&link) else {
+                continue;
+            };
+
+            definitions.push(LinkDefinition {
+                rects: vec![rect],
+                action,
+            });
+        }
+
+        Ok(definitions)
     }
 }
 
