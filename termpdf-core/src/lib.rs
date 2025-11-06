@@ -815,11 +815,33 @@ impl DocumentInstance {
             return Some(false);
         }
 
+        let mut initialized = false;
+        if state.current_index.is_none() {
+            let desired = state
+                .links
+                .iter()
+                .position(|link| link.page == self.state.current_page)
+                .or_else(|| {
+                    state
+                        .links
+                        .iter()
+                        .position(|link| link.page > self.state.current_page)
+                })
+                .or(Some(0));
+            state.current_index = desired;
+            initialized = state.current_index.is_some();
+        }
+
+        let Some(current_index) = state.current_index else {
+            return Some(false);
+        };
+
+        if initialized {
+            return Some(self.apply_link_index(current_index));
+        }
+
         let total = state.links.len();
-        let current = state
-            .current_index
-            .unwrap_or(0)
-            .min(total.saturating_sub(1));
+        let current = current_index.min(total.saturating_sub(1));
         let steps = count % total;
         if steps == 0 {
             return Some(self.apply_link_index(current));
@@ -1836,6 +1858,52 @@ mod tests {
             },
             other => panic!("unexpected activation result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn link_mode_skips_links_before_current_page() {
+        let path = PathBuf::from("/tmp/link-skip.pdf");
+        let info = DocumentInfo {
+            id: document_id_for_path(&path),
+            path,
+            page_count: 3,
+            metadata: DocumentMetadata::default(),
+        };
+
+        let links = vec![
+            vec![LinkDefinition {
+                rects: vec![NormalizedRect {
+                    left: 0.1,
+                    top: 0.1,
+                    right: 0.2,
+                    bottom: 0.2,
+                }],
+                action: LinkAction::GoTo { page: 0 },
+            }],
+            Vec::new(),
+            vec![LinkDefinition {
+                rects: vec![NormalizedRect {
+                    left: 0.3,
+                    top: 0.3,
+                    right: 0.4,
+                    bottom: 0.4,
+                }],
+                action: LinkAction::GoTo { page: 2 },
+            }],
+        ];
+
+        let backend = Arc::new(LinkBackend::new(info.clone(), links));
+        let mut state = PersistedDocumentState::default();
+        state.current_page = 1;
+        let mut instance = DocumentInstance::new(info, backend, state, Vec::new());
+
+        instance.start_link_mode().expect("link mode");
+        let summary = instance.link_summary().expect("link summary present");
+        assert_eq!(summary.current_index, None);
+
+        let result = instance.next_link(1).expect("advance link");
+        assert!(result);
+        assert_eq!(instance.state.current_page, 2);
     }
 
     #[test]
