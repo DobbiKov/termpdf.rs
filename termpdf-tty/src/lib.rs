@@ -501,6 +501,19 @@ mod tests {
             other => panic!("unexpected event: {:?}", other),
         }
 
+        match mapper.map_event(key_event(KeyCode::Char('n'))) {
+            UiEvent::TocSearchNext { count } => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('N'),
+            KeyModifiers::SHIFT,
+        )) {
+            UiEvent::TocSearchPrev { count } => assert_eq!(count, 1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
         match mapper.map_event(key_event(KeyCode::Char('g'))) {
             UiEvent::TocGotoStart => {}
             other => panic!("unexpected event: {:?}", other),
@@ -513,6 +526,26 @@ mod tests {
             UiEvent::TocGotoEnd => {}
             other => panic!("unexpected event: {:?}", other),
         }
+
+        match mapper.map_event(key_event(KeyCode::Char('/'))) {
+            UiEvent::TocBeginSearch => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::TocSearch);
+        assert_eq!(mapper.pending_input().as_deref(), Some("/"));
+
+        match mapper.map_event(key_event(KeyCode::Char('f'))) {
+            UiEvent::TocSearchQueryChanged { query } => assert_eq!(query, "f"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.pending_input().as_deref(), Some("/f"));
+
+        match mapper.map_event(key_event(KeyCode::Enter)) {
+            UiEvent::TocSearchSubmit { query } => assert_eq!(query, "f"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Toc);
+        assert!(mapper.pending_input().is_none());
 
         match mapper.map_event(key_event(KeyCode::Enter)) {
             UiEvent::TocActivateSelection => {}
@@ -548,6 +581,30 @@ mod tests {
         mapper.set_mode(InputMode::Normal);
         assert!(mapper.pending_input().is_none());
     }
+
+    #[test]
+    fn event_mapper_toc_search_handles_cancel() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Toc);
+
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('/'))),
+            UiEvent::TocBeginSearch
+        ));
+        assert_eq!(mapper.mode(), InputMode::TocSearch);
+
+        match mapper.map_event(key_event(KeyCode::Char('a'))) {
+            UiEvent::TocSearchQueryChanged { query } => assert_eq!(query, "a"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Esc)) {
+            UiEvent::TocSearchCancel => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Toc);
+        assert!(mapper.pending_input().is_none());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +613,12 @@ pub enum UiEvent {
     OpenTableOfContents,
     CloseOverlay,
     TocMoveSelection { delta: isize },
+    TocBeginSearch,
+    TocSearchQueryChanged { query: String },
+    TocSearchSubmit { query: String },
+    TocSearchCancel,
+    TocSearchNext { count: usize },
+    TocSearchPrev { count: usize },
     TocGotoStart,
     TocGotoEnd,
     TocActivateSelection,
@@ -571,6 +634,7 @@ pub enum UiEvent {
 pub enum InputMode {
     Normal,
     Toc,
+    TocSearch,
     Search,
     Link,
 }
@@ -588,6 +652,7 @@ pub struct EventMapper {
     char_stack: String,
     mode: InputMode,
     search_buffer: String,
+    toc_search_buffer: String,
 }
 
 impl EventMapper {
@@ -602,11 +667,17 @@ impl EventMapper {
             if matches!(self.mode, InputMode::Search) {
                 self.search_buffer.clear();
             }
+            if matches!(self.mode, InputMode::TocSearch) {
+                self.toc_search_buffer.clear();
+            }
             self.reset_count();
             self.reset_char_stack();
             self.mode = mode;
             if matches!(self.mode, InputMode::Search) {
                 self.search_buffer.clear();
+            }
+            if matches!(self.mode, InputMode::TocSearch) {
+                self.toc_search_buffer.clear();
             }
         }
     }
@@ -619,6 +690,7 @@ impl EventMapper {
         match self.mode {
             InputMode::Normal => self.map_event_normal(event),
             InputMode::Toc => self.map_event_toc(event),
+            InputMode::TocSearch => self.map_event_toc_search(event),
             InputMode::Search => self.map_event_search(event),
             InputMode::Link => self.map_event_link(event),
         }
@@ -789,6 +861,16 @@ impl EventMapper {
                     let steps = Self::clamp_count_to_isize(self.take_count());
                     UiEvent::TocMoveSelection { delta: -steps }
                 }
+                (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                    let count = self.take_count();
+                    UiEvent::TocSearchNext { count }
+                }
+                (KeyCode::Char('N'), modifiers)
+                    if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+                {
+                    let count = self.take_count();
+                    UiEvent::TocSearchPrev { count }
+                }
                 (KeyCode::Char('g'), KeyModifiers::NONE) | (KeyCode::Home, _) => {
                     self.reset_count();
                     UiEvent::TocGotoStart
@@ -797,9 +879,45 @@ impl EventMapper {
                     self.reset_count();
                     UiEvent::TocGotoEnd
                 }
+                (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                    self.start_toc_search();
+                    UiEvent::TocBeginSearch
+                }
                 (KeyCode::Char('q'), _) => {
                     self.reset_count();
                     UiEvent::Quit
+                }
+                _ => UiEvent::None,
+            },
+            _ => UiEvent::None,
+        }
+    }
+
+    fn map_event_toc_search(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.set_mode(InputMode::Toc);
+                    UiEvent::TocSearchCancel
+                }
+                (KeyCode::Enter, _) => {
+                    let query = self.toc_search_buffer.clone();
+                    self.set_mode(InputMode::Toc);
+                    UiEvent::TocSearchSubmit { query }
+                }
+                (KeyCode::Backspace, _) => {
+                    self.toc_search_buffer.pop();
+                    UiEvent::TocSearchQueryChanged {
+                        query: self.toc_search_buffer.clone(),
+                    }
+                }
+                (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.toc_search_buffer.push(c);
+                    UiEvent::TocSearchQueryChanged {
+                        query: self.toc_search_buffer.clone(),
+                    }
                 }
                 _ => UiEvent::None,
             },
@@ -919,6 +1037,10 @@ impl EventMapper {
         self.set_mode(InputMode::Link);
     }
 
+    fn start_toc_search(&mut self) {
+        self.set_mode(InputMode::TocSearch);
+    }
+
     fn clamp_count_to_isize(count: usize) -> isize {
         if count > isize::MAX as usize {
             isize::MAX
@@ -939,6 +1061,9 @@ impl EventMapper {
     pub fn pending_input(&self) -> Option<String> {
         if matches!(self.mode, InputMode::Search) {
             return Some(format!("/{}", self.search_buffer));
+        }
+        if matches!(self.mode, InputMode::TocSearch) {
+            return Some(format!("/{}", self.toc_search_buffer));
         }
         if matches!(self.mode, InputMode::Link) {
             let mut label = String::from("link");

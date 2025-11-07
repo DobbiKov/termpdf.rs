@@ -143,10 +143,10 @@ async fn main() -> Result<()> {
 
     loop {
         if overlay.is_active() {
-            if event_mapper.mode() != InputMode::Toc {
+            if !matches!(event_mapper.mode(), InputMode::Toc | InputMode::TocSearch) {
                 event_mapper.set_mode(InputMode::Toc);
             }
-        } else if matches!(event_mapper.mode(), InputMode::Toc) {
+        } else if matches!(event_mapper.mode(), InputMode::Toc | InputMode::TocSearch) {
             event_mapper.set_mode(InputMode::Normal);
         }
 
@@ -188,6 +188,7 @@ async fn main() -> Result<()> {
                             if let OverlayState::Toc(toc) = &mut overlay {
                                 toc.entries = active.outline().to_vec();
                                 toc.update_selection_for_page(active.state.current_page);
+                                toc.rebuild_search_matches();
                             }
                             needs_initial_clear = true;
                             dirty = true;
@@ -296,6 +297,9 @@ struct TocWindow {
     selected: usize,
     current: Option<usize>,
     scroll_offset: usize,
+    search_query: Option<String>,
+    search_matches: Vec<usize>,
+    search_input: Option<String>,
 }
 
 impl TocWindow {
@@ -307,6 +311,9 @@ impl TocWindow {
             selected,
             current,
             scroll_offset: 0,
+            search_query: None,
+            search_matches: Vec::new(),
+            search_input: None,
         }
     }
 
@@ -337,30 +344,30 @@ impl TocWindow {
         self.current.filter(|&idx| idx < self.entries.len())
     }
 
-    fn move_selection(&mut self, delta: isize) -> bool {
+    fn set_selected(&mut self, index: usize) -> bool {
         if self.entries.is_empty() {
             return false;
         }
-        let len = self.entries.len() as isize;
-        let next = (self.selected as isize + delta).clamp(0, len - 1) as usize;
-        if next != self.selected {
-            self.selected = next;
+        let clamped = index.min(self.entries.len().saturating_sub(1));
+        if clamped != self.selected {
+            self.selected = clamped;
             true
         } else {
             false
         }
     }
 
-    fn select_first(&mut self) -> bool {
+    fn move_selection(&mut self, delta: isize) -> bool {
         if self.entries.is_empty() {
             return false;
         }
-        if self.selected != 0 {
-            self.selected = 0;
-            true
-        } else {
-            false
-        }
+        let len = self.entries.len() as isize;
+        let next = (self.selected as isize + delta).clamp(0, len - 1) as usize;
+        self.set_selected(next)
+    }
+
+    fn select_first(&mut self) -> bool {
+        self.set_selected(0)
     }
 
     fn select_last(&mut self) -> bool {
@@ -368,12 +375,7 @@ impl TocWindow {
             return false;
         }
         let last = self.entries.len() - 1;
-        if self.selected != last {
-            self.selected = last;
-            true
-        } else {
-            false
-        }
+        self.set_selected(last)
     }
 
     fn ensure_visible(&mut self, viewport_height: usize) {
@@ -414,6 +416,135 @@ impl TocWindow {
         } else {
             self.selected = 0;
             self.current = None;
+        }
+    }
+
+    fn begin_search(&mut self) -> bool {
+        if self.search_input.is_some() {
+            false
+        } else {
+            self.search_input = Some(String::new());
+            self.search_query = None;
+            self.search_matches.clear();
+            true
+        }
+    }
+
+    fn update_search_query(&mut self, query: &str) -> bool {
+        self.search_input = Some(query.to_string());
+        self.apply_search_query(query)
+    }
+
+    fn finish_search_input(&mut self) -> bool {
+        if self.search_input.take().is_some() {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_search(&mut self) -> bool {
+        let mut changed = false;
+        if self.search_input.take().is_some() {
+            changed = true;
+        }
+        if self.search_query.take().is_some() || !self.search_matches.is_empty() {
+            self.search_matches.clear();
+            changed = true;
+        }
+        changed
+    }
+
+    fn apply_search_query(&mut self, query: &str) -> bool {
+        if query.is_empty() {
+            let cleared = self.search_query.take().is_some() || !self.search_matches.is_empty();
+            self.search_matches.clear();
+            return cleared;
+        }
+        self.search_query = Some(query.to_string());
+        self.recompute_search_matches(query)
+    }
+
+    fn recompute_search_matches(&mut self, query: &str) -> bool {
+        let needle = query.to_lowercase();
+        let mut matches = Vec::new();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.title.to_lowercase().contains(&needle) {
+                matches.push(idx);
+            }
+        }
+        self.search_matches = matches;
+        if self.search_matches.is_empty() {
+            return false;
+        }
+        let target = self
+            .search_matches
+            .iter()
+            .copied()
+            .find(|&idx| idx >= self.selected)
+            .or_else(|| self.search_matches.first().copied());
+        if let Some(target) = target {
+            self.set_selected(target)
+        } else {
+            false
+        }
+    }
+
+    fn search_prompt(&self) -> Option<String> {
+        self.search_input
+            .as_ref()
+            .map(|input| format!("/{}", input))
+    }
+
+    fn active_query(&self) -> Option<&str> {
+        self.search_query.as_deref()
+    }
+
+    fn entry_matches(&self, index: usize) -> bool {
+        self.search_matches.binary_search(&index).is_ok()
+    }
+
+    fn search_next(&mut self, count: usize) -> bool {
+        self.advance_search(count.max(1), true)
+    }
+
+    fn search_prev(&mut self, count: usize) -> bool {
+        self.advance_search(count.max(1), false)
+    }
+
+    fn advance_search(&mut self, count: usize, forward: bool) -> bool {
+        if self.search_matches.is_empty() {
+            return false;
+        }
+        let len = self.search_matches.len();
+        let mut index = if forward {
+            self.search_matches
+                .iter()
+                .position(|&idx| idx > self.selected)
+                .unwrap_or(0)
+        } else {
+            self.search_matches
+                .iter()
+                .rposition(|&idx| idx < self.selected)
+                .unwrap_or(len - 1)
+        };
+        if len > 0 {
+            let offset = (count - 1) % len;
+            if forward {
+                index = (index + offset) % len;
+            } else {
+                index = (index + len - (offset % len)) % len;
+            }
+        }
+        let target = self.search_matches[index];
+        self.set_selected(target)
+    }
+
+    fn rebuild_search_matches(&mut self) {
+        if let Some(query) = self.search_query.clone() {
+            let _ = self.recompute_search_matches(&query);
+        } else {
+            self.search_matches.clear();
         }
     }
 }
@@ -517,6 +648,55 @@ fn handle_event(
         UiEvent::TocMoveSelection { delta } => {
             if let OverlayState::Toc(toc) = overlay {
                 if toc.move_selection(delta) {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocBeginSearch => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.begin_search() {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocSearchQueryChanged { query } => {
+            if let OverlayState::Toc(toc) = overlay {
+                toc.update_search_query(&query);
+                return Ok(LoopAction::ContinueRedraw);
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocSearchSubmit { query } => {
+            if let OverlayState::Toc(toc) = overlay {
+                let mut redraw = toc.apply_search_query(&query);
+                redraw |= toc.finish_search_input();
+                if redraw {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocSearchCancel => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.cancel_search() {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocSearchNext { count } => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.search_next(count) {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocSearchPrev { count } => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.search_prev(count) {
                     return Ok(LoopAction::ContinueRedraw);
                 }
             }
@@ -822,7 +1002,15 @@ fn draw_toc_overlay(
     if max_window_height < 6 {
         return Ok(());
     }
-    let max_content_height = max_window_height.saturating_sub(4) as usize;
+
+    let search_prompt = toc.search_prompt();
+    let extra_header_rows = if search_prompt.is_some() { 1u32 } else { 0u32 };
+    let header_rows = 4 + extra_header_rows;
+    if max_window_height < header_rows {
+        return Ok(());
+    }
+
+    let max_content_height = max_window_height.saturating_sub(header_rows) as usize;
     if max_content_height == 0 {
         return Ok(());
     }
@@ -835,7 +1023,7 @@ fn draw_toc_overlay(
         toc.scroll_offset = max_scroll;
     }
 
-    let window_height = (content_height + 4) as u32;
+    let window_height = (content_height as u32).saturating_add(header_rows);
     if window_height > max_window_height {
         return Ok(());
     }
@@ -857,21 +1045,31 @@ fn draw_toc_overlay(
         start_col_u16,
         current_row,
         &format!("+{}+", horizontal_border),
+        false,
     )?;
     current_row = current_row.saturating_add(1);
 
     let title_line = format!("|{: ^inner_width$}|", TITLE, inner_width = inner_width);
-    print_inverted(&mut writer, start_col_u16, current_row, &title_line)?;
+    print_inverted(&mut writer, start_col_u16, current_row, &title_line, false)?;
     current_row = current_row.saturating_add(1);
 
+    if let Some(prompt) = search_prompt.as_ref() {
+        let content = truncate_with_ellipsis(format!("  {}", prompt), inner_width);
+        let line = format!("|{}|", content);
+        print_inverted(&mut writer, start_col_u16, current_row, &line, false)?;
+        current_row = current_row.saturating_add(1);
+    }
+
     let divider = format!("|{}|", "-".repeat(inner_width));
-    print_inverted(&mut writer, start_col_u16, current_row, &divider)?;
+    print_inverted(&mut writer, start_col_u16, current_row, &divider, false)?;
     current_row = current_row.saturating_add(1);
+
+    let active_query = toc.active_query().map(|q| q.to_string());
 
     if toc.is_empty() {
         let content = truncate_with_ellipsis(format!("  {}", EMPTY_MESSAGE), inner_width);
         let line = format!("|{}|", content);
-        print_inverted(&mut writer, start_col_u16, current_row, &line)?;
+        print_inverted(&mut writer, start_col_u16, current_row, &line, false)?;
         current_row = current_row.saturating_add(1);
     } else {
         let start_index = toc.scroll_offset;
@@ -883,16 +1081,24 @@ fn draw_toc_overlay(
                 .current_index()
                 .map(|current| current == idx)
                 .unwrap_or(false);
-            let content = format_toc_line(entry, selected, current, inner_width);
+            let matching = toc.entry_matches(idx);
+            let content = format_toc_line(
+                entry,
+                selected,
+                current,
+                matching,
+                active_query.as_deref(),
+                inner_width,
+            );
             let line = format!("|{}|", content);
-            print_inverted(&mut writer, start_col_u16, current_row, &line)?;
+            print_inverted(&mut writer, start_col_u16, current_row, &line, matching)?;
             current_row = current_row.saturating_add(1);
         }
 
         let rendered = end_index - start_index;
         for _ in rendered..content_height {
             let line = format!("|{}|", " ".repeat(inner_width));
-            print_inverted(&mut writer, start_col_u16, current_row, &line)?;
+            print_inverted(&mut writer, start_col_u16, current_row, &line, false)?;
             current_row = current_row.saturating_add(1);
         }
     }
@@ -902,19 +1108,37 @@ fn draw_toc_overlay(
         start_col_u16,
         current_row,
         &format!("+{}+", horizontal_border),
+        false,
     )?;
 
     Ok(())
 }
 
-fn print_inverted(writer: &mut impl Write, col: u16, row: u16, content: &str) -> Result<()> {
-    crossterm::execute!(
-        writer,
-        cursor::MoveTo(col, row),
-        SetAttribute(Attribute::Reverse),
-        Print(content),
-        SetAttribute(Attribute::Reset)
-    )?;
+fn print_inverted(
+    writer: &mut impl Write,
+    col: u16,
+    row: u16,
+    content: &str,
+    highlight: bool,
+) -> Result<()> {
+    if highlight {
+        crossterm::execute!(
+            writer,
+            cursor::MoveTo(col, row),
+            SetAttribute(Attribute::Reverse),
+            SetAttribute(Attribute::Bold),
+            Print(content),
+            SetAttribute(Attribute::Reset)
+        )?;
+    } else {
+        crossterm::execute!(
+            writer,
+            cursor::MoveTo(col, row),
+            SetAttribute(Attribute::Reverse),
+            Print(content),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
     Ok(())
 }
 
@@ -922,30 +1146,81 @@ fn toc_line_length(entry: &OutlineItem) -> usize {
     let indent_levels = entry.depth.min(8);
     let indent_width = indent_levels * 2;
     let page_suffix = format!(" (p{})", entry.page_index + 1);
-    3 + indent_width + entry.title.len() + page_suffix.len()
+    4 + indent_width + entry.title.len() + page_suffix.len()
 }
 
 fn format_toc_line(
     entry: &OutlineItem,
     selected: bool,
     current: bool,
+    matching: bool,
+    active_query: Option<&str>,
     inner_width: usize,
 ) -> String {
     let selected_marker = if selected { '>' } else { ' ' };
     let current_marker = if current { '*' } else { ' ' };
+    let match_marker = if matching { '+' } else { ' ' };
     let indent_levels = entry.depth.min(8);
     let indent = "  ".repeat(indent_levels);
     let page_suffix = format!(" (p{})", entry.page_index + 1);
 
+    let title = if matching {
+        highlight_search_segment(&entry.title, active_query)
+    } else {
+        entry.title.clone()
+    };
+
     let mut text = String::new();
     text.push(selected_marker);
     text.push(current_marker);
+    text.push(match_marker);
     text.push(' ');
     text.push_str(&indent);
-    text.push_str(&entry.title);
+    text.push_str(&title);
     text.push_str(&page_suffix);
 
     truncate_with_ellipsis(text, inner_width)
+}
+
+fn highlight_search_segment(title: &str, query: Option<&str>) -> String {
+    if let Some(query) = query {
+        if !query.is_empty() && title.is_ascii() && query.is_ascii() {
+            if let Some((start, end)) = find_ascii_match_range(title, query) {
+                let mut highlighted = String::with_capacity(title.len() + 2);
+                highlighted.push_str(&title[..start]);
+                highlighted.push('[');
+                highlighted.push_str(&title[start..end]);
+                highlighted.push(']');
+                highlighted.push_str(&title[end..]);
+                return highlighted;
+            }
+        }
+    }
+    title.to_string()
+}
+
+fn find_ascii_match_range(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    if !haystack.is_ascii() || !needle.is_ascii() {
+        return None;
+    }
+    let hay = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.len() > hay.len() {
+        return None;
+    }
+    for start in 0..=hay.len() - needle_bytes.len() {
+        if hay[start..start + needle_bytes.len()]
+            .iter()
+            .zip(needle_bytes)
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
+        {
+            return Some((start, start + needle_bytes.len()));
+        }
+    }
+    None
 }
 
 fn truncate_with_ellipsis(mut text: String, width: usize) -> String {
@@ -962,6 +1237,52 @@ fn truncate_with_ellipsis(mut text: String, width: usize) -> String {
         text.push_str(&" ".repeat(width - text.len()));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outline(title: &str, page_index: usize) -> OutlineItem {
+        OutlineItem {
+            title: title.to_string(),
+            page_index,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn toc_search_moves_between_matches() {
+        let entries = vec![
+            outline("Intro", 0),
+            outline("Chapter One", 1),
+            outline("Chapter Two", 2),
+        ];
+        let mut toc = TocWindow::from_outline(entries, 0);
+        assert!(toc.begin_search());
+        assert!(toc.update_search_query("chapter"));
+        assert_eq!(toc.selected, 1);
+        assert!(toc.search_next(1));
+        assert_eq!(toc.selected, 2);
+        assert!(toc.search_next(1));
+        assert_eq!(toc.selected, 1);
+        assert!(toc.search_prev(1));
+        assert_eq!(toc.selected, 2);
+    }
+
+    #[test]
+    fn toc_search_cancel_resets_state() {
+        let entries = vec![outline("Intro", 0)];
+        let mut toc = TocWindow::from_outline(entries, 0);
+        assert!(toc.begin_search());
+        toc.update_search_query("intro");
+        assert_eq!(toc.search_matches.len(), 1);
+        assert!(toc.finish_search_input());
+        assert!(toc.cancel_search());
+        assert!(toc.search_query.is_none());
+        assert!(toc.search_matches.is_empty());
+        assert!(toc.search_prompt().is_none());
+    }
 }
 
 fn init_logging(project_dirs: &ProjectDirs) -> Result<WorkerGuard> {
