@@ -9,7 +9,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-authors = ["TermPDF Maintainers"]
+authors = ["Yehor Korotenko"]
 license = "MIT"
 
 [workspace.dependencies]
