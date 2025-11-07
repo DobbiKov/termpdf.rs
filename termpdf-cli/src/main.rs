@@ -294,24 +294,18 @@ impl OverlayState {
 struct TocWindow {
     entries: Vec<OutlineItem>,
     selected: usize,
+    current: Option<usize>,
     scroll_offset: usize,
 }
 
 impl TocWindow {
     fn from_outline(entries: Vec<OutlineItem>, current_page: usize) -> Self {
-        let mut selected = 0;
-        if !entries.is_empty() {
-            for (idx, item) in entries.iter().enumerate() {
-                if item.page_index <= current_page {
-                    selected = idx;
-                } else {
-                    break;
-                }
-            }
-        }
+        let current = Self::entry_for_page(&entries, current_page);
+        let selected = current.unwrap_or(0);
         Self {
             entries,
             selected,
+            current,
             scroll_offset: 0,
         }
     }
@@ -324,6 +318,25 @@ impl TocWindow {
         self.entries.get(self.selected)
     }
 
+    fn entry_for_page(entries: &[OutlineItem], current_page: usize) -> Option<usize> {
+        if entries.is_empty() {
+            return None;
+        }
+        let mut selected = 0;
+        for (idx, item) in entries.iter().enumerate() {
+            if item.page_index <= current_page {
+                selected = idx;
+            } else {
+                break;
+            }
+        }
+        Some(selected)
+    }
+
+    fn current_index(&self) -> Option<usize> {
+        self.current.filter(|&idx| idx < self.entries.len())
+    }
+
     fn move_selection(&mut self, delta: isize) -> bool {
         if self.entries.is_empty() {
             return false;
@@ -332,6 +345,31 @@ impl TocWindow {
         let next = (self.selected as isize + delta).clamp(0, len - 1) as usize;
         if next != self.selected {
             self.selected = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_first(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        if self.selected != 0 {
+            self.selected = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_last(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let last = self.entries.len() - 1;
+        if self.selected != last {
+            self.selected = last;
             true
         } else {
             false
@@ -367,17 +405,16 @@ impl TocWindow {
         if self.entries.is_empty() {
             self.selected = 0;
             self.scroll_offset = 0;
+            self.current = None;
             return;
         }
-        let mut next = 0;
-        for (idx, item) in self.entries.iter().enumerate() {
-            if item.page_index <= current_page {
-                next = idx;
-            } else {
-                break;
-            }
+        if let Some(next) = Self::entry_for_page(&self.entries, current_page) {
+            self.selected = next;
+            self.current = Some(next);
+        } else {
+            self.selected = 0;
+            self.current = None;
         }
-        self.selected = next;
     }
 }
 
@@ -480,6 +517,22 @@ fn handle_event(
         UiEvent::TocMoveSelection { delta } => {
             if let OverlayState::Toc(toc) = overlay {
                 if toc.move_selection(delta) {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocGotoStart => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.select_first() {
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            Ok(LoopAction::Continue)
+        }
+        UiEvent::TocGotoEnd => {
+            if let OverlayState::Toc(toc) = overlay {
+                if toc.select_last() {
                     return Ok(LoopAction::ContinueRedraw);
                 }
             }
@@ -826,7 +879,11 @@ fn draw_toc_overlay(
         for idx in start_index..end_index {
             let entry = &toc.entries[idx];
             let selected = idx == toc.selected;
-            let content = format_toc_line(entry, selected, inner_width);
+            let current = toc
+                .current_index()
+                .map(|current| current == idx)
+                .unwrap_or(false);
+            let content = format_toc_line(entry, selected, current, inner_width);
             let line = format!("|{}|", content);
             print_inverted(&mut writer, start_col_u16, current_row, &line)?;
             current_row = current_row.saturating_add(1);
@@ -865,17 +922,24 @@ fn toc_line_length(entry: &OutlineItem) -> usize {
     let indent_levels = entry.depth.min(8);
     let indent_width = indent_levels * 2;
     let page_suffix = format!(" (p{})", entry.page_index + 1);
-    2 + indent_width + entry.title.len() + page_suffix.len()
+    3 + indent_width + entry.title.len() + page_suffix.len()
 }
 
-fn format_toc_line(entry: &OutlineItem, selected: bool, inner_width: usize) -> String {
-    let marker = if selected { '>' } else { ' ' };
+fn format_toc_line(
+    entry: &OutlineItem,
+    selected: bool,
+    current: bool,
+    inner_width: usize,
+) -> String {
+    let selected_marker = if selected { '>' } else { ' ' };
+    let current_marker = if current { '*' } else { ' ' };
     let indent_levels = entry.depth.min(8);
     let indent = "  ".repeat(indent_levels);
     let page_suffix = format!(" (p{})", entry.page_index + 1);
 
     let mut text = String::new();
-    text.push(marker);
+    text.push(selected_marker);
+    text.push(current_marker);
     text.push(' ');
     text.push_str(&indent);
     text.push_str(&entry.title);

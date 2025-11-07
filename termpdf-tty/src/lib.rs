@@ -482,13 +482,35 @@ mod tests {
         let mut mapper = EventMapper::new();
         mapper.set_mode(InputMode::Toc);
 
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('1'))),
+            UiEvent::None
+        ));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('2'))),
+            UiEvent::None
+        ));
+
         match mapper.map_event(key_event(KeyCode::Char('j'))) {
-            UiEvent::TocMoveSelection { delta } => assert_eq!(delta, 1),
+            UiEvent::TocMoveSelection { delta } => assert_eq!(delta, 12),
             other => panic!("unexpected event: {:?}", other),
         }
 
         match mapper.map_event(key_event(KeyCode::Char('k'))) {
             UiEvent::TocMoveSelection { delta } => assert_eq!(delta, -1),
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Char('g'))) {
+            UiEvent::TocGotoStart => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char('G'),
+            KeyModifiers::SHIFT,
+        )) {
+            UiEvent::TocGotoEnd => {}
             other => panic!("unexpected event: {:?}", other),
         }
 
@@ -534,6 +556,8 @@ pub enum UiEvent {
     OpenTableOfContents,
     CloseOverlay,
     TocMoveSelection { delta: isize },
+    TocGotoStart,
+    TocGotoEnd,
     TocActivateSelection,
     BeginSearch,
     SearchQueryChanged { query: String },
@@ -738,19 +762,47 @@ impl EventMapper {
         match event {
             Event::Key(KeyEvent {
                 code, modifiers, ..
-            }) => {
-                match (code, modifiers) {
-                    (KeyCode::Esc, _) => UiEvent::CloseOverlay,
-                    (KeyCode::Char('t'), _) | (KeyCode::Char('T'), _) => UiEvent::CloseOverlay,
-                    (KeyCode::Enter, _) => UiEvent::TocActivateSelection,
-                    (KeyCode::Char('j'), KeyModifiers::NONE)
-                    | (KeyCode::Down, KeyModifiers::NONE) => UiEvent::TocMoveSelection { delta: 1 },
-                    (KeyCode::Char('k'), KeyModifiers::NONE)
-                    | (KeyCode::Up, KeyModifiers::NONE) => UiEvent::TocMoveSelection { delta: -1 },
-                    (KeyCode::Char('q'), _) => UiEvent::Quit,
-                    _ => UiEvent::None,
+            }) => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.reset_count();
+                    UiEvent::CloseOverlay
                 }
-            }
+                (KeyCode::Char('t'), _) | (KeyCode::Char('T'), _) => {
+                    self.reset_count();
+                    UiEvent::CloseOverlay
+                }
+                (KeyCode::Enter, _) => {
+                    self.reset_count();
+                    UiEvent::TocActivateSelection
+                }
+                (KeyCode::Char(c), KeyModifiers::NONE) if c.is_ascii_digit() => {
+                    if let Some(digit) = c.to_digit(10) {
+                        self.push_digit(digit as usize);
+                    }
+                    UiEvent::None
+                }
+                (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
+                    let steps = Self::clamp_count_to_isize(self.take_count());
+                    UiEvent::TocMoveSelection { delta: steps }
+                }
+                (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, KeyModifiers::NONE) => {
+                    let steps = Self::clamp_count_to_isize(self.take_count());
+                    UiEvent::TocMoveSelection { delta: -steps }
+                }
+                (KeyCode::Char('g'), KeyModifiers::NONE) | (KeyCode::Home, _) => {
+                    self.reset_count();
+                    UiEvent::TocGotoStart
+                }
+                (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => {
+                    self.reset_count();
+                    UiEvent::TocGotoEnd
+                }
+                (KeyCode::Char('q'), _) => {
+                    self.reset_count();
+                    UiEvent::Quit
+                }
+                _ => UiEvent::None,
+            },
             _ => UiEvent::None,
         }
     }
@@ -865,6 +917,14 @@ impl EventMapper {
 
     fn start_link_mode(&mut self) {
         self.set_mode(InputMode::Link);
+    }
+
+    fn clamp_count_to_isize(count: usize) -> isize {
+        if count > isize::MAX as usize {
+            isize::MAX
+        } else {
+            count as isize
+        }
     }
 
     fn pan(&mut self, delta_x: f32, delta_y: f32) -> UiEvent {
