@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::cursor;
 use crossterm::event;
-use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
@@ -44,6 +44,7 @@ struct Args {
 }
 
 const FILE_POLL_INTERVAL_MS: u64 = 300;
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "macos")]
 const OPEN_COMMAND: &str = "open";
@@ -240,12 +241,13 @@ async fn main() -> Result<()> {
     let mut renderer = KittyRenderer::new(stdout);
     let mut event_mapper = EventMapper::new();
     let mut overlay = OverlayState::None;
+    let mut status_bar = StatusBar::default();
     let mut dirty = true;
     let mut needs_initial_clear = true;
     let file_poll_interval = Duration::from_millis(FILE_POLL_INTERVAL_MS);
 
     loop {
-        if overlay.is_active() {
+        if overlay.requires_toc_mode() {
             if !matches!(event_mapper.mode(), InputMode::Toc | InputMode::TocSearch) {
                 event_mapper.set_mode(InputMode::Toc);
             }
@@ -350,28 +352,40 @@ async fn main() -> Result<()> {
             let ev = event::read()?;
             let ui_event = event_mapper.map_event(ev);
             let pending = event_mapper.pending_input();
+            status_bar.prune_expired();
             if !overlay.is_active() {
-                if let Some(status) = combine_status(document_status(&session), pending.as_deref())
+                if let Some(message) = status_bar.message() {
+                    draw_status_message(&mut renderer, message)?;
+                } else if let Some(status) =
+                    combine_status(document_status(&session), pending.as_deref())
                 {
                     draw_status_line(&mut renderer, &status)?;
                 }
             }
             let overlay_was_active = overlay.is_active();
+            let overlay_was_fullscreen = matches!(overlay, OverlayState::Toc(_));
             match handle_event(
                 ui_event,
                 &mut session,
                 &mut overlay,
                 &mut event_mapper,
                 &mut search_manager,
+                &mut status_bar,
             )? {
                 LoopAction::ContinueRedraw => dirty = true,
                 LoopAction::Continue => {}
                 LoopAction::Quit => break,
             }
             watched_docs.retain(|entry| session.contains_document(entry.id));
+            let overlay_is_fullscreen = matches!(overlay, OverlayState::Toc(_));
             if overlay.is_active() != overlay_was_active {
-                needs_initial_clear = true;
+                if overlay_is_fullscreen || overlay_was_fullscreen {
+                    needs_initial_clear = true;
+                }
                 dirty = true;
+            }
+            if overlay_is_fullscreen != overlay_was_fullscreen {
+                needs_initial_clear = true;
             }
         }
     }
@@ -394,6 +408,7 @@ enum LoopAction {
 enum OverlayState {
     None,
     Toc(TocWindow),
+    Command(CommandOverlay),
 }
 
 impl OverlayState {
@@ -403,6 +418,197 @@ impl OverlayState {
 
     fn is_active(&self) -> bool {
         !matches!(self, OverlayState::None)
+    }
+
+    fn requires_toc_mode(&self) -> bool {
+        matches!(self, OverlayState::Toc(_))
+    }
+
+    fn is_command(&self) -> bool {
+        matches!(self, OverlayState::Command(_))
+    }
+
+    fn command_mut(&mut self) -> Option<&mut CommandOverlay> {
+        match self {
+            OverlayState::Command(cmd) => Some(cmd),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandOverlay {
+    buffer: String,
+    cursor: usize,
+    status: CommandStatus,
+}
+
+impl CommandOverlay {
+    fn new(buffer: String, cursor: usize) -> Self {
+        Self {
+            buffer,
+            cursor,
+            status: CommandStatus::default(),
+        }
+    }
+
+    fn update_input(&mut self, buffer: String, cursor: usize) {
+        let changed = self.buffer != buffer;
+        self.buffer = buffer;
+        self.cursor = self.buffer.len().min(cursor);
+        if changed && matches!(self.status.kind, CommandStatusKind::Error) {
+            self.status = CommandStatus::default();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_status(&mut self, status: CommandStatus) {
+        self.status = status;
+    }
+
+    fn visible_prompt(&self, max_cols: usize) -> (String, usize) {
+        if max_cols == 0 {
+            return (String::new(), 0);
+        }
+        let mut chars: Vec<char> = Vec::with_capacity(self.buffer.chars().count() + 1);
+        chars.push(':');
+        chars.extend(self.buffer.chars());
+        let cursor_chars = 1
+            + self
+                .buffer
+                .get(..self.cursor.min(self.buffer.len()))
+                .map(|segment| segment.chars().count())
+                .unwrap_or(0);
+        if chars.len() <= max_cols {
+            let display: String = chars.iter().collect();
+            return (display, cursor_chars.min(chars.len()));
+        }
+
+        let total = chars.len();
+        let mut start = if cursor_chars <= max_cols {
+            0
+        } else if cursor_chars >= total {
+            total.saturating_sub(max_cols)
+        } else {
+            cursor_chars.saturating_sub(max_cols)
+        };
+        if start + max_cols > total {
+            start = total.saturating_sub(max_cols);
+        }
+        let end = (start + max_cols).min(total);
+        let display: String = chars[start..end].iter().collect();
+        let cursor_in_view = cursor_chars.saturating_sub(start).min(max_cols);
+        (display, cursor_in_view)
+    }
+
+    fn write_status(&self, writer: &mut impl Write, available_cols: usize) -> io::Result<()> {
+        if available_cols == 0 || self.status.message.is_empty() {
+            return Ok(());
+        }
+        let text = truncate_with_ellipsis(self.status.message.clone(), available_cols);
+        match self.status.kind {
+            CommandStatusKind::Info => {}
+            CommandStatusKind::Error => {
+                crossterm::execute!(writer, SetForegroundColor(Color::Red))?;
+            }
+            CommandStatusKind::Progress => {
+                crossterm::execute!(writer, SetForegroundColor(Color::Yellow))?;
+            }
+        }
+        write!(writer, "{}", text)?;
+        crossterm::execute!(writer, SetForegroundColor(Color::Reset))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandStatus {
+    message: String,
+    kind: CommandStatusKind,
+}
+
+impl CommandStatus {
+    fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CommandStatusKind::Info,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CommandStatusKind::Error,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn progress(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CommandStatusKind::Progress,
+        }
+    }
+}
+
+impl Default for CommandStatus {
+    fn default() -> Self {
+        CommandStatus::info("Command mode")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStatusKind {
+    Info,
+    Error,
+    Progress,
+}
+
+struct StatusMessage {
+    text: String,
+    kind: CommandStatusKind,
+    expires_at: Option<Instant>,
+}
+
+impl StatusMessage {
+    fn new(text: impl Into<String>, kind: CommandStatusKind, ttl: Option<Duration>) -> Self {
+        let expires_at = ttl.map(|ttl| Instant::now() + ttl);
+        Self {
+            text: text.into(),
+            kind,
+            expires_at,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(deadline) => Instant::now() >= deadline,
+            None => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct StatusBar {
+    message: Option<StatusMessage>,
+}
+
+impl StatusBar {
+    fn set_message(&mut self, message: StatusMessage) {
+        self.message = Some(message);
+    }
+
+    fn message(&self) -> Option<&StatusMessage> {
+        self.message.as_ref()
+    }
+
+    fn prune_expired(&mut self) {
+        if let Some(message) = &self.message {
+            if message.is_expired() {
+                self.message = None;
+            }
+        }
     }
 }
 
@@ -669,6 +875,7 @@ fn handle_event(
     overlay: &mut OverlayState,
     mapper: &mut EventMapper,
     search_manager: &mut SearchManager,
+    status_bar: &mut StatusBar,
 ) -> Result<LoopAction> {
     match event {
         UiEvent::BeginSearch => Ok(LoopAction::Continue),
@@ -683,6 +890,48 @@ fn handle_event(
         UiEvent::SearchCancel => {
             handle_search_input(String::new(), session, search_manager)?;
             Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::CommandModeBegin { buffer, cursor } => {
+            *overlay = OverlayState::Command(CommandOverlay::new(buffer, cursor));
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::CommandModeChanged { buffer, cursor } => {
+            if let Some(command) = overlay.command_mut() {
+                command.update_input(buffer, cursor);
+                Ok(LoopAction::ContinueRedraw)
+            } else {
+                Ok(LoopAction::Continue)
+            }
+        }
+        UiEvent::CommandModeCancel => {
+            if overlay.is_command() {
+                overlay.deactivate();
+                Ok(LoopAction::ContinueRedraw)
+            } else {
+                Ok(LoopAction::Continue)
+            }
+        }
+        UiEvent::CommandModeSubmit { command } => {
+            let trimmed = command.trim().to_string();
+            if !trimmed.is_empty() {
+                mapper.push_command_history(&trimmed);
+            }
+            overlay.deactivate();
+            if trimmed.is_empty() {
+                return Ok(LoopAction::ContinueRedraw);
+            }
+            let normalized = trimmed.to_ascii_lowercase();
+            match normalized.as_str() {
+                "q" | "quit" => Ok(LoopAction::Quit),
+                _ => {
+                    status_bar.set_message(StatusMessage::new(
+                        format!("Undefined command: {}", trimmed),
+                        CommandStatusKind::Error,
+                        Some(STATUS_MESSAGE_TTL),
+                    ));
+                    Ok(LoopAction::ContinueRedraw)
+                }
+            }
         }
         UiEvent::Command(cmd) => {
             let mut redraw = matches!(
@@ -896,12 +1145,12 @@ fn redraw(
     let image_rows_available = total_rows.saturating_sub(1).max(1);
 
     if let Some(doc) = session.active() {
-        if overlay.is_active() {
+        if matches!(overlay, OverlayState::Toc(_)) {
             {
                 let mut writer = renderer.writer();
                 crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
             }
-            draw_overlay(renderer, overlay, total_cols, image_rows_available)?;
+            draw_overlay(renderer, overlay, total_cols, total_rows, image_rows_available)?;
             return Ok(());
         }
 
@@ -1039,7 +1288,7 @@ fn redraw(
             );
         }
 
-        draw_overlay(renderer, overlay, total_cols, image_rows_available)?;
+        draw_overlay(renderer, overlay, total_cols, total_rows, image_rows_available)?;
     } else {
         overlay.deactivate();
     }
@@ -1078,16 +1327,105 @@ fn draw_status_line(renderer: &mut KittyRenderer<io::Stdout>, status: &str) -> R
     Ok(())
 }
 
+fn draw_status_message(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    message: &StatusMessage,
+) -> Result<()> {
+    let window = terminal::window_size()?;
+    let total_cols = u32::from(window.columns).max(1) as usize;
+    let total_rows = u32::from(window.rows).max(1);
+    let status_row = total_rows.saturating_sub(1);
+    let mut writer = renderer.writer();
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(0, status_row as u16),
+        Clear(ClearType::CurrentLine)
+    )?;
+    let clipped = truncate_with_ellipsis(message.text.clone(), total_cols);
+    let color = match message.kind {
+        CommandStatusKind::Info => Color::White,
+        CommandStatusKind::Error => Color::Red,
+        CommandStatusKind::Progress => Color::Yellow,
+    };
+    crossterm::execute!(&mut writer, SetForegroundColor(color))?;
+    write!(writer, "{}", clipped)?;
+    crossterm::execute!(&mut writer, SetForegroundColor(Color::Reset))?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn draw_overlay(
     renderer: &mut KittyRenderer<io::Stdout>,
     overlay: &mut OverlayState,
     total_cols: u32,
+    total_rows: u32,
     image_rows_available: u32,
 ) -> Result<()> {
     match overlay {
-        OverlayState::Toc(toc) => draw_toc_overlay(renderer, toc, total_cols, image_rows_available),
-        OverlayState::None => Ok(()),
+        OverlayState::Toc(toc) => {
+            {
+                let mut writer = renderer.writer();
+                crossterm::execute!(&mut writer, cursor::Hide)?;
+            }
+            draw_toc_overlay(renderer, toc, total_cols, image_rows_available)
+        }
+        OverlayState::Command(command) => {
+            draw_command_overlay(renderer, command, total_cols, total_rows)
+        }
+        OverlayState::None => {
+            let mut writer = renderer.writer();
+            crossterm::execute!(&mut writer, cursor::Hide)?;
+            Ok(())
+        }
     }
+}
+
+fn draw_command_overlay(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    overlay: &CommandOverlay,
+    total_cols: u32,
+    total_rows: u32,
+) -> Result<()> {
+    if total_cols == 0 || total_rows == 0 {
+        return Ok(());
+    }
+    let status_row = total_rows.saturating_sub(1);
+    let max_cols = total_cols as usize;
+    let mut writer = renderer.writer();
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(0, status_row as u16),
+        Clear(ClearType::CurrentLine)
+    )?;
+
+    if max_cols == 0 {
+        crossterm::execute!(&mut writer, cursor::Show)?;
+        return Ok(());
+    }
+
+    let (prompt, cursor_col) = overlay.visible_prompt(max_cols);
+    write!(writer, "{}", prompt)?;
+    let mut used_cols = prompt.chars().count().min(max_cols);
+
+    if used_cols < max_cols {
+        write!(writer, " ")?;
+        used_cols = (used_cols + 1).min(max_cols);
+    }
+
+    if used_cols < max_cols {
+        let available = max_cols - used_cols;
+        overlay.write_status(&mut writer, available)?;
+    }
+
+    let cursor_limit = max_cols.saturating_sub(1);
+    let cursor_position = cursor_col.min(cursor_limit) as u16;
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(cursor_position, status_row as u16),
+        cursor::Show
+    )?;
+
+    Ok(())
 }
 
 fn draw_toc_overlay(

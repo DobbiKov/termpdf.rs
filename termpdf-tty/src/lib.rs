@@ -221,6 +221,110 @@ mod tests {
     }
 
     #[test]
+    fn event_mapper_enters_command_mode_with_colon() {
+        let mut mapper = EventMapper::new();
+        match mapper.map_event(key_event_with_modifiers(
+            KeyCode::Char(':'),
+            KeyModifiers::SHIFT,
+        )) {
+            UiEvent::CommandModeBegin { buffer, cursor } => {
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.pending_input().as_deref(), Some(":"));
+    }
+
+    #[test]
+    fn event_mapper_command_mode_supports_editing_and_submit() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event_with_modifiers(
+                KeyCode::Char(':'),
+                KeyModifiers::SHIFT
+            )),
+            UiEvent::CommandModeBegin { .. }
+        ));
+
+        match mapper.map_event(key_event(KeyCode::Char('q'))) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert_eq!(buffer, "q");
+                assert_eq!(cursor, "q".len());
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Backspace)) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Char('w'))) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert_eq!(buffer, "w");
+                assert_eq!(cursor, 1);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Enter)) {
+            UiEvent::CommandModeSubmit { command } => assert_eq!(command, "w"),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_mapper_command_mode_recalls_history() {
+        let mut mapper = EventMapper::new();
+        mapper.push_command_history("q");
+        mapper.push_command_history("wq");
+
+        assert!(matches!(
+            mapper.map_event(key_event_with_modifiers(
+                KeyCode::Char(':'),
+                KeyModifiers::SHIFT
+            )),
+            UiEvent::CommandModeBegin { .. }
+        ));
+
+        match mapper.map_event(key_event(KeyCode::Up)) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert_eq!(buffer, "wq");
+                assert_eq!(cursor, 2);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Up)) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert_eq!(buffer, "q");
+                assert_eq!(cursor, 1);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Down)) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert_eq!(buffer, "wq");
+                assert_eq!(cursor, 2);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match mapper.map_event(key_event(KeyCode::Down)) {
+            UiEvent::CommandModeChanged { buffer, cursor } => {
+                assert!(buffer.is_empty());
+                assert_eq!(cursor, 0);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
     fn event_mapper_pending_input_shows_char_stack_until_completed() {
         let mut mapper = EventMapper::new();
         assert!(mapper.pending_input().is_none());
@@ -626,6 +730,10 @@ pub enum UiEvent {
     SearchQueryChanged { query: String },
     SearchSubmit { query: String },
     SearchCancel,
+    CommandModeBegin { buffer: String, cursor: usize },
+    CommandModeChanged { buffer: String, cursor: usize },
+    CommandModeSubmit { command: String },
+    CommandModeCancel,
     Quit,
     None,
 }
@@ -637,6 +745,7 @@ pub enum InputMode {
     TocSearch,
     Search,
     Link,
+    Command,
 }
 
 impl Default for InputMode {
@@ -653,10 +762,16 @@ pub struct EventMapper {
     mode: InputMode,
     search_buffer: String,
     toc_search_buffer: String,
+    command_buffer: String,
+    command_cursor: usize,
+    command_history: Vec<String>,
+    command_history_index: Option<usize>,
+    command_draft: String,
 }
 
 impl EventMapper {
     const PAN_STEP: f32 = 0.1;
+    const COMMAND_HISTORY_LIMIT: usize = 100;
 
     pub fn new() -> Self {
         Self::default()
@@ -670,6 +785,9 @@ impl EventMapper {
             if matches!(self.mode, InputMode::TocSearch) {
                 self.toc_search_buffer.clear();
             }
+            if matches!(self.mode, InputMode::Command) {
+                self.reset_command_input();
+            }
             self.reset_count();
             self.reset_char_stack();
             self.mode = mode;
@@ -678,6 +796,9 @@ impl EventMapper {
             }
             if matches!(self.mode, InputMode::TocSearch) {
                 self.toc_search_buffer.clear();
+            }
+            if matches!(self.mode, InputMode::Command) {
+                self.reset_command_input();
             }
         }
     }
@@ -693,6 +814,7 @@ impl EventMapper {
             InputMode::TocSearch => self.map_event_toc_search(event),
             InputMode::Search => self.map_event_search(event),
             InputMode::Link => self.map_event_link(event),
+            InputMode::Command => self.map_event_command(event),
         }
     }
 
@@ -764,6 +886,13 @@ impl EventMapper {
                 (KeyCode::Char('l'), KeyModifiers::NONE) => {
                     self.start_link_mode();
                     UiEvent::Command(Command::EnterLinkMode)
+                }
+                (KeyCode::Char(':'), mods)
+                    if mods.is_empty() || mods == KeyModifiers::SHIFT =>
+                {
+                    self.set_mode(InputMode::Command);
+                    let (buffer, cursor) = self.command_state_payload();
+                    UiEvent::CommandModeBegin { buffer, cursor }
                 }
                 (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     let count = self.take_count();
@@ -998,6 +1127,76 @@ impl EventMapper {
         }
     }
 
+    fn map_event_command(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.set_mode(InputMode::Normal);
+                    UiEvent::CommandModeCancel
+                }
+                (KeyCode::Enter, _) => {
+                    let command = self.command_buffer.clone();
+                    self.set_mode(InputMode::Normal);
+                    UiEvent::CommandModeSubmit { command }
+                }
+                (KeyCode::Backspace, _) => {
+                    if self.delete_prev_command_char() {
+                        let (buffer, cursor) = self.command_state_payload();
+                        UiEvent::CommandModeChanged { buffer, cursor }
+                    } else {
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Left, _) => {
+                    if self.move_command_cursor_left() {
+                        let (buffer, cursor) = self.command_state_payload();
+                        UiEvent::CommandModeChanged { buffer, cursor }
+                    } else {
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Right, _) => {
+                    if self.move_command_cursor_right() {
+                        let (buffer, cursor) = self.command_state_payload();
+                        UiEvent::CommandModeChanged { buffer, cursor }
+                    } else {
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Up, _) => {
+                    if self.recall_command_history(true) {
+                        let (buffer, cursor) = self.command_state_payload();
+                        UiEvent::CommandModeChanged { buffer, cursor }
+                    } else {
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Down, _) => {
+                    if self.recall_command_history(false) {
+                        let (buffer, cursor) = self.command_state_payload();
+                        UiEvent::CommandModeChanged { buffer, cursor }
+                    } else {
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Char(c), mods)
+                    if mods.is_empty() || mods == KeyModifiers::SHIFT =>
+                {
+                    if self.insert_command_char(c) {
+                        let (buffer, cursor) = self.command_state_payload();
+                        UiEvent::CommandModeChanged { buffer, cursor }
+                    } else {
+                        UiEvent::None
+                    }
+                }
+                _ => UiEvent::None,
+            },
+            _ => UiEvent::None,
+        }
+    }
+
     fn push_digit(&mut self, digit: usize) {
         let current = self.pending_count.unwrap_or(0);
         let next = current.saturating_mul(10).saturating_add(digit);
@@ -1027,6 +1226,13 @@ impl EventMapper {
     }
     fn reset_char_stack(&mut self) {
         self.char_stack = String::new();
+    }
+
+    fn reset_command_input(&mut self) {
+        self.command_buffer.clear();
+        self.command_cursor = 0;
+        self.command_history_index = None;
+        self.command_draft.clear();
     }
 
     fn start_search(&mut self) {
@@ -1065,6 +1271,9 @@ impl EventMapper {
         if matches!(self.mode, InputMode::TocSearch) {
             return Some(format!("/{}", self.toc_search_buffer));
         }
+        if matches!(self.mode, InputMode::Command) {
+            return Some(format!(":{}", self.command_buffer));
+        }
         if matches!(self.mode, InputMode::Link) {
             let mut label = String::from("link");
             if !self.pending_digits.is_empty() {
@@ -1084,6 +1293,124 @@ impl EventMapper {
             None
         } else {
             Some(pending)
+        }
+    }
+
+    pub fn push_command_history(&mut self, command: &str) {
+        if command.trim().is_empty() {
+            return;
+        }
+        if self
+            .command_history
+            .last()
+            .map(|last| last == command)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.command_history.push(command.to_string());
+        if self.command_history.len() > Self::COMMAND_HISTORY_LIMIT {
+            self.command_history.remove(0);
+        }
+    }
+
+    fn command_state_payload(&self) -> (String, usize) {
+        (self.command_buffer.clone(), self.command_cursor)
+    }
+
+    fn insert_command_char(&mut self, ch: char) -> bool {
+        let idx = self.command_cursor.min(self.command_buffer.len());
+        self.command_buffer.insert(idx, ch);
+        self.command_cursor = idx + ch.len_utf8();
+        true
+    }
+
+    fn delete_prev_command_char(&mut self) -> bool {
+        if self.command_cursor == 0 {
+            return false;
+        }
+        let prev_len = self
+            .command_buffer[..self.command_cursor]
+            .chars()
+            .next_back()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        let start = self.command_cursor.saturating_sub(prev_len);
+        self.command_buffer.drain(start..self.command_cursor);
+        self.command_cursor = start;
+        true
+    }
+
+    fn move_command_cursor_left(&mut self) -> bool {
+        if self.command_cursor == 0 {
+            return false;
+        }
+        let shift = self
+            .command_buffer[..self.command_cursor]
+            .chars()
+            .next_back()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        if shift == 0 {
+            return false;
+        }
+        self.command_cursor -= shift;
+        true
+    }
+
+    fn move_command_cursor_right(&mut self) -> bool {
+        if self.command_cursor >= self.command_buffer.len() {
+            return false;
+        }
+        let shift = self
+            .command_buffer[self.command_cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        if shift == 0 {
+            return false;
+        }
+        self.command_cursor += shift;
+        true
+    }
+
+    fn recall_command_history(&mut self, older: bool) -> bool {
+        if self.command_history.is_empty() {
+            return false;
+        }
+        let len = self.command_history.len();
+        if older {
+            match self.command_history_index {
+                None => {
+                    self.command_draft = self.command_buffer.clone();
+                    self.command_history_index = Some(len - 1);
+                }
+                Some(0) => return false,
+                Some(idx) => self.command_history_index = Some(idx - 1),
+            }
+        } else {
+            match self.command_history_index {
+                None => return false,
+                Some(idx) if idx + 1 < len => {
+                    self.command_history_index = Some(idx + 1);
+                }
+                Some(_) => {
+                    self.command_history_index = None;
+                    self.command_buffer = self.command_draft.clone();
+                    self.command_cursor = self.command_buffer.len();
+                    self.command_draft.clear();
+                    return true;
+                }
+            }
+        }
+
+        if let Some(idx) = self.command_history_index {
+            self.command_buffer = self.command_history[idx].clone();
+            self.command_cursor = self.command_buffer.len();
+            true
+        } else {
+            false
         }
     }
 }
