@@ -1,4 +1,5 @@
 use std::convert::TryFrom;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -49,6 +50,7 @@ struct PdfiumDocument {
     info: DocumentInfo,
     cache: Mutex<Option<RenderCacheEntry>>,
     outline_cache: Mutex<Option<Vec<OutlineItem>>>,
+    document: Mutex<Option<PdfDocument<'static>>>,
 }
 
 struct RenderCacheEntry {
@@ -66,13 +68,35 @@ impl PdfiumDocument {
             info,
             cache: Mutex::new(None),
             outline_cache: Mutex::new(None),
+            document: Mutex::new(None),
         }
     }
 
-    fn load_document(&self) -> Result<PdfDocument<'_>> {
-        self.pdfium
+    fn open_document(&self) -> Result<PdfDocument<'static>> {
+        let document = self
+            .pdfium
             .load_pdf_from_file(&self.path, None)
-            .with_context(|| format!("failed to open {:?}", self.path))
+            .with_context(|| format!("failed to open {:?}", self.path))?;
+        // SAFETY: the returned PdfDocument holds a reference to the Pdfium bindings owned by
+        // self.pdfium. The document is stored inside self.document and will be dropped before the
+        // Pdfium instance because struct fields drop in reverse order of declaration (document
+        // precedes pdfium). This ensures the reference remains valid for the lifetime of the
+        // cached PdfDocument.
+        let document = unsafe { mem::transmute::<PdfDocument<'_>, PdfDocument<'static>>(document) };
+        Ok(document)
+    }
+
+    fn with_document<R, F>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&PdfDocument<'static>) -> Result<R>,
+    {
+        let mut guard = self.document.lock();
+        if guard.is_none() {
+            let document = self.open_document()?;
+            *guard = Some(document);
+        }
+        let document = guard.as_ref().expect("document must be loaded");
+        f(document)
     }
 
     fn render_internal(
@@ -165,8 +189,7 @@ impl DocumentBackend for PdfiumDocument {
             }
         }
 
-        let document = self.load_document()?;
-        let image = self.render_internal(&document, &request)?;
+        let image = self.with_document(|document| self.render_internal(document, &request))?;
 
         let mut cache = self.cache.lock();
         *cache = Some(RenderCacheEntry {
@@ -187,12 +210,13 @@ impl DocumentBackend for PdfiumDocument {
             }
         }
 
-        let document = self.load_document()?;
-        let mut outline = Vec::new();
-
-        if let Some(root) = document.bookmarks().root() {
-            collect_outline(root, 0, &mut outline);
-        }
+        let outline = self.with_document(|document| {
+            let mut outline = Vec::new();
+            if let Some(root) = document.bookmarks().root() {
+                collect_outline(root, 0, &mut outline);
+            }
+            Ok(outline)
+        })?;
 
         let mut cache = self.outline_cache.lock();
         *cache = Some(outline.clone());
@@ -201,18 +225,19 @@ impl DocumentBackend for PdfiumDocument {
     }
 
     fn page_text(&self, page_index: usize) -> Result<String> {
-        let document = self.load_document()?;
-        let page_index: PdfPageIndex = page_index
-            .try_into()
-            .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
-        let page = document
-            .pages()
-            .get(page_index)
-            .with_context(|| format!("page {} out of range", page_index))?;
-        let text = page
-            .text()
-            .with_context(|| format!("failed to extract text for page {}", page_index))?;
-        Ok(text.all())
+        self.with_document(|document| {
+            let page_index: PdfPageIndex = page_index
+                .try_into()
+                .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
+            let page = document
+                .pages()
+                .get(page_index)
+                .with_context(|| format!("page {} out of range", page_index))?;
+            let text = page
+                .text()
+                .with_context(|| format!("failed to extract text for page {}", page_index))?;
+            Ok(text.all())
+        })
     }
 
     fn search_page(&self, page_index: usize, query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
@@ -220,118 +245,120 @@ impl DocumentBackend for PdfiumDocument {
             return Ok(Vec::new());
         }
 
-        let document = self.load_document()?;
-        let page_index: PdfPageIndex = page_index
-            .try_into()
-            .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
-        let page = document
-            .pages()
-            .get(page_index)
-            .with_context(|| format!("page {} out of range", page_index))?;
-        let text = page
-            .text()
-            .with_context(|| format!("failed to extract text for page {}", page_index))?;
+        self.with_document(|document| {
+            let page_index: PdfPageIndex = page_index
+                .try_into()
+                .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
+            let page = document
+                .pages()
+                .get(page_index)
+                .with_context(|| format!("page {} out of range", page_index))?;
+            let text = page
+                .text()
+                .with_context(|| format!("failed to extract text for page {}", page_index))?;
 
-        let options = PdfSearchOptions::new();
-        let search = text
-            .search(query, &options)
-            .with_context(|| format!("failed to perform search on page {}", page_index))?;
+            let options = PdfSearchOptions::new();
+            let search = text
+                .search(query, &options)
+                .with_context(|| format!("failed to perform search on page {}", page_index))?;
 
-        let page_width = page.width().value;
-        let page_height = page.height().value;
-        if page_width <= 0.0 || page_height <= 0.0 {
-            return Ok(Vec::new());
-        }
-
-        let mut results = Vec::new();
-        while let Some(segments) = search.find_next() {
-            let mut rects = Vec::new();
-            for segment in segments.iter() {
-                let bounds = segment.bounds();
-                let left = (bounds.left().value / page_width).clamp(0.0, 1.0);
-                let right = (bounds.right().value / page_width).clamp(0.0, 1.0);
-                let top_ratio = bounds.top().value / page_height;
-                let bottom_ratio = bounds.bottom().value / page_height;
-                let top_norm = (1.0 - top_ratio).clamp(0.0, 1.0);
-                let bottom_norm = (1.0 - bottom_ratio).clamp(0.0, 1.0);
-                let rect = NormalizedRect {
-                    left,
-                    top: top_norm,
-                    right,
-                    bottom: bottom_norm,
-                }
-                .clamp();
-                if rect.is_valid() {
-                    rects.push(rect);
-                }
+            let page_width = page.width().value;
+            let page_height = page.height().value;
+            if page_width <= 0.0 || page_height <= 0.0 {
+                return Ok(Vec::new());
             }
-            results.push(rects);
-        }
 
-        Ok(results)
+            let mut results = Vec::new();
+            while let Some(segments) = search.find_next() {
+                let mut rects = Vec::new();
+                for segment in segments.iter() {
+                    let bounds = segment.bounds();
+                    let left = (bounds.left().value / page_width).clamp(0.0, 1.0);
+                    let right = (bounds.right().value / page_width).clamp(0.0, 1.0);
+                    let top_ratio = bounds.top().value / page_height;
+                    let bottom_ratio = bounds.bottom().value / page_height;
+                    let top_norm = (1.0 - top_ratio).clamp(0.0, 1.0);
+                    let bottom_norm = (1.0 - bottom_ratio).clamp(0.0, 1.0);
+                    let rect = NormalizedRect {
+                        left,
+                        top: top_norm,
+                        right,
+                        bottom: bottom_norm,
+                    }
+                    .clamp();
+                    if rect.is_valid() {
+                        rects.push(rect);
+                    }
+                }
+                results.push(rects);
+            }
+
+            Ok(results)
+        })
     }
 
     fn page_links(&self, page_index: usize) -> Result<Vec<LinkDefinition>> {
-        let document = self.load_document()?;
-        let page_index: PdfPageIndex = page_index
-            .try_into()
-            .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
-        let page = document
-            .pages()
-            .get(page_index)
-            .with_context(|| format!("page {} out of range", page_index))?;
+        self.with_document(|document| {
+            let page_index: PdfPageIndex = page_index
+                .try_into()
+                .map_err(|_| anyhow!("page {} is out of supported range", page_index))?;
+            let page = document
+                .pages()
+                .get(page_index)
+                .with_context(|| format!("page {} out of range", page_index))?;
 
-        let page_width = page.width().value;
-        let page_height = page.height().value;
-        if page_width <= 0.0 || page_height <= 0.0 {
-            return Ok(Vec::new());
-        }
+            let page_width = page.width().value;
+            let page_height = page.height().value;
+            if page_width <= 0.0 || page_height <= 0.0 {
+                return Ok(Vec::new());
+            }
 
-        let mut definitions = Vec::new();
-        let links = page.links();
-        for link in links.iter() {
-            let rect = match link.rect() {
-                Ok(rect) => rect,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        page = page_index as usize,
-                        path = %self.path.display(),
-                        "failed to resolve link rectangle"
-                    );
+            let mut definitions = Vec::new();
+            let links = page.links();
+            for link in links.iter() {
+                let rect = match link.rect() {
+                    Ok(rect) => rect,
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            page = page_index as usize,
+                            path = %self.path.display(),
+                            "failed to resolve link rectangle"
+                        );
+                        continue;
+                    }
+                };
+
+                let left = (rect.left().value / page_width).clamp(0.0, 1.0);
+                let right = (rect.right().value / page_width).clamp(0.0, 1.0);
+                let top_ratio = rect.top().value / page_height;
+                let bottom_ratio = rect.bottom().value / page_height;
+                let top = (1.0 - top_ratio).clamp(0.0, 1.0);
+                let bottom = (1.0 - bottom_ratio).clamp(0.0, 1.0);
+                let rect = NormalizedRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                }
+                .clamp();
+
+                if !rect.is_valid() {
                     continue;
                 }
-            };
 
-            let left = (rect.left().value / page_width).clamp(0.0, 1.0);
-            let right = (rect.right().value / page_width).clamp(0.0, 1.0);
-            let top_ratio = rect.top().value / page_height;
-            let bottom_ratio = rect.bottom().value / page_height;
-            let top = (1.0 - top_ratio).clamp(0.0, 1.0);
-            let bottom = (1.0 - bottom_ratio).clamp(0.0, 1.0);
-            let rect = NormalizedRect {
-                left,
-                top,
-                right,
-                bottom,
-            }
-            .clamp();
+                let Some(action) = self.link_action_from_pdfium(&link) else {
+                    continue;
+                };
 
-            if !rect.is_valid() {
-                continue;
+                definitions.push(LinkDefinition {
+                    rects: vec![rect],
+                    action,
+                });
             }
 
-            let Some(action) = self.link_action_from_pdfium(&link) else {
-                continue;
-            };
-
-            definitions.push(LinkDefinition {
-                rects: vec![rect],
-                action,
-            });
-        }
-
-        Ok(definitions)
+            Ok(definitions)
+        })
     }
 }
 

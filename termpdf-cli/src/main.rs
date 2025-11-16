@@ -14,11 +14,14 @@ use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
-    Command, DocumentId, DocumentInstance, ExternalLink, FileStateStore, Highlights, LinkSummary,
-    NormalizedRect, OutlineItem, RenderImage, Session, SessionEvent, StateStore,
+    Command, DocumentId, DocumentInstance, ExternalLink, FileStateStore, Highlights,
+    NormalizedRect, OutlineItem, RenderImage, SearchMatch, Session, SessionEvent, StateStore,
 };
 use termpdf_render::PdfRenderFactory;
 use termpdf_tty::{write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent};
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::task;
 use tracing::{trace, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -78,6 +81,104 @@ impl WatchedDocument {
     }
 }
 
+struct SearchResultMessage {
+    token: u64,
+    doc_id: DocumentId,
+    start_page: usize,
+    query: String,
+    result: Result<Vec<SearchMatch>>,
+}
+
+struct ActiveSearch {
+    token: u64,
+    doc_id: DocumentId,
+}
+
+struct SearchManager {
+    sender: UnboundedSender<SearchResultMessage>,
+    active: Option<ActiveSearch>,
+    next_token: u64,
+}
+
+impl SearchManager {
+    fn new(sender: UnboundedSender<SearchResultMessage>) -> Self {
+        Self {
+            sender,
+            active: None,
+            next_token: 0,
+        }
+    }
+
+    fn start_search(&mut self, session: &Session, query: String) {
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            self.cancel_pending();
+            return;
+        }
+
+        let Some(doc) = session.active() else {
+            self.cancel_pending();
+            return;
+        };
+
+        let context = doc.search_context();
+        let doc_id = doc.info.id;
+        let start_page = doc.current_page();
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
+        self.active = Some(ActiveSearch { token, doc_id });
+        let tx = self.sender.clone();
+
+        task::spawn_blocking(move || {
+            let matches = context.build_search_matches(&trimmed);
+            let _ = tx.send(SearchResultMessage {
+                token,
+                doc_id,
+                start_page,
+                query: trimmed,
+                result: matches,
+            });
+        });
+    }
+
+    fn cancel_pending(&mut self) {
+        self.active = None;
+    }
+
+    fn handle_result(
+        &mut self,
+        session: &mut Session,
+        message: SearchResultMessage,
+    ) -> Result<bool> {
+        let apply = match &self.active {
+            Some(active) => active.token == message.token && active.doc_id == message.doc_id,
+            None => false,
+        };
+
+        if !apply {
+            return Ok(false);
+        }
+
+        self.active = None;
+
+        match message.result {
+            Ok(matches) => {
+                session.apply_search_results(
+                    message.doc_id,
+                    message.query,
+                    matches,
+                    message.start_page,
+                )?;
+                Ok(true)
+            }
+            Err(err) => {
+                warn!(?err, "failed to compute search results");
+                Ok(false)
+            }
+        }
+    }
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -109,6 +210,8 @@ async fn main() -> Result<()> {
     let store: Arc<dyn StateStore> = Arc::new(FileStateStore::new(state_dir.clone())?);
     let mut session = Session::new(store);
     let mut watched_docs = Vec::new();
+    let (search_tx, mut search_rx) = mpsc::unbounded_channel();
+    let mut search_manager = SearchManager::new(search_tx);
 
     let provider = PdfRenderFactory::new()?;
     for path in &args.files {
@@ -208,6 +311,18 @@ async fn main() -> Result<()> {
             }
         }
 
+        loop {
+            match search_rx.try_recv() {
+                Ok(message) => {
+                    if search_manager.handle_result(&mut session, message)? {
+                        dirty = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
         if process_session_events(&session) {
             dirty = true;
         }
@@ -242,7 +357,13 @@ async fn main() -> Result<()> {
                 }
             }
             let overlay_was_active = overlay.is_active();
-            match handle_event(ui_event, &mut session, &mut overlay, &mut event_mapper)? {
+            match handle_event(
+                ui_event,
+                &mut session,
+                &mut overlay,
+                &mut event_mapper,
+                &mut search_manager,
+            )? {
                 LoopAction::ContinueRedraw => dirty = true,
                 LoopAction::Continue => {}
                 LoopAction::Quit => break,
@@ -282,13 +403,6 @@ impl OverlayState {
 
     fn is_active(&self) -> bool {
         !matches!(self, OverlayState::None)
-    }
-
-    fn toc_mut(&mut self) -> Option<&mut TocWindow> {
-        match self {
-            OverlayState::Toc(ref mut toc) => Some(toc),
-            OverlayState::None => None,
-        }
     }
 }
 
@@ -554,24 +668,20 @@ fn handle_event(
     session: &mut Session,
     overlay: &mut OverlayState,
     mapper: &mut EventMapper,
+    search_manager: &mut SearchManager,
 ) -> Result<LoopAction> {
     match event {
         UiEvent::BeginSearch => Ok(LoopAction::Continue),
         UiEvent::SearchQueryChanged { query } => {
-            session.apply(Command::Search { query })?;
-            let _ = process_session_events(session);
+            handle_search_input(query, session, search_manager)?;
             Ok(LoopAction::ContinueRedraw)
         }
         UiEvent::SearchSubmit { query } => {
-            session.apply(Command::Search { query })?;
-            let _ = process_session_events(session);
+            handle_search_input(query, session, search_manager)?;
             Ok(LoopAction::ContinueRedraw)
         }
         UiEvent::SearchCancel => {
-            session.apply(Command::Search {
-                query: String::new(),
-            })?;
-            let _ = process_session_events(session);
+            handle_search_input(String::new(), session, search_manager)?;
             Ok(LoopAction::ContinueRedraw)
         }
         UiEvent::Command(cmd) => {
@@ -735,6 +845,23 @@ fn handle_event(
         UiEvent::Quit => Ok(LoopAction::Quit),
         UiEvent::None => Ok(LoopAction::Continue),
     }
+}
+
+fn handle_search_input(
+    query: String,
+    session: &mut Session,
+    search_manager: &mut SearchManager,
+) -> Result<()> {
+    if query.trim().is_empty() {
+        search_manager.cancel_pending();
+        session.apply(Command::Search {
+            query: String::new(),
+        })?;
+        let _ = process_session_events(session);
+    } else {
+        search_manager.start_search(session, query);
+    }
+    Ok(())
 }
 
 fn process_session_events(session: &Session) -> bool {
