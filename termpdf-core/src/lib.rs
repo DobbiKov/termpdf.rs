@@ -227,7 +227,7 @@ impl JumpHistory {
 }
 
 #[derive(Debug, Clone)]
-struct SearchMatch {
+pub struct SearchMatch {
     page: usize,
     rects: Vec<NormalizedRect>,
 }
@@ -342,9 +342,108 @@ pub struct DocumentInstance {
     render_cache: Mutex<HashMap<CacheKey, RenderImage>>,
     outline: Vec<OutlineItem>,
     jump_history: JumpHistory,
-    text_cache: Mutex<HashMap<usize, Arc<String>>>,
+    text_cache: Arc<Mutex<HashMap<usize, Arc<String>>>>,
     search_state: Option<SearchState>,
     link_state: Option<LinkState>,
+}
+
+#[derive(Clone)]
+pub struct DocumentSearchContext {
+    info: DocumentInfo,
+    backend: Arc<dyn DocumentBackend>,
+    text_cache: Arc<Mutex<HashMap<usize, Arc<String>>>>,
+}
+
+impl DocumentSearchContext {
+    fn load_page_text(&self, page_index: usize) -> Result<Arc<String>> {
+        if page_index >= self.info.page_count {
+            return Err(anyhow!("page {} out of range", page_index));
+        }
+
+        if let Some(text) = self.text_cache.lock().get(&page_index).cloned() {
+            return Ok(text);
+        }
+
+        let text = self.backend.page_text(page_index)?;
+        let text = Arc::new(text);
+        self.text_cache.lock().insert(page_index, Arc::clone(&text));
+        Ok(text)
+    }
+
+    pub fn build_search_matches(&self, query: &str) -> Result<Vec<SearchMatch>> {
+        let mut matches = Vec::new();
+
+        if query.is_empty() {
+            return Ok(matches);
+        }
+
+        let query_lower = query.to_lowercase();
+        let step = query_lower.len().max(1);
+
+        for page in 0..self.info.page_count {
+            let mut page_matches = match self.backend.search_page(page, query) {
+                Ok(rect_sets) => rect_sets,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        page,
+                        path = %self.info.path.display(),
+                        "backend search failed; falling back to text search"
+                    );
+                    Vec::new()
+                }
+            };
+
+            if !page_matches.is_empty() {
+                for rects in page_matches.drain(..) {
+                    let rects: Vec<NormalizedRect> = rects
+                        .into_iter()
+                        .map(|rect| rect.clamp())
+                        .filter(|rect| rect.is_valid())
+                        .collect();
+                    matches.push(SearchMatch { page, rects });
+                }
+                continue;
+            }
+
+            match self.load_page_text(page) {
+                Ok(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    let lower = text.to_lowercase();
+                    let mut offset = 0usize;
+                    while offset < lower.len() {
+                        if let Some(pos) = lower[offset..].find(&query_lower) {
+                            let absolute = offset + pos;
+                            matches.push(SearchMatch {
+                                page,
+                                rects: Vec::new(),
+                            });
+                            let next = absolute.saturating_add(step);
+                            if next <= offset {
+                                break;
+                            }
+                            offset = next;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        page,
+                        path = %self.info.path.display(),
+                        "failed to extract text for search"
+                    );
+                }
+            }
+        }
+
+        Ok(matches)
+    }
 }
 
 impl DocumentInstance {
@@ -361,13 +460,25 @@ impl DocumentInstance {
             render_cache: Mutex::new(HashMap::new()),
             outline,
             jump_history: JumpHistory::default(),
-            text_cache: Mutex::new(HashMap::new()),
+            text_cache: Arc::new(Mutex::new(HashMap::new())),
             search_state: None,
             link_state: None,
         };
         let initial = instance.current_position();
         instance.jump_history.record_initial(initial);
         instance
+    }
+
+    pub fn current_page(&self) -> usize {
+        self.state.current_page
+    }
+
+    pub fn search_context(&self) -> DocumentSearchContext {
+        DocumentSearchContext {
+            info: self.info.clone(),
+            backend: Arc::clone(&self.backend),
+            text_cache: Arc::clone(&self.text_cache),
+        }
     }
 
     pub fn render(&self) -> Result<RenderImage> {
@@ -559,96 +670,6 @@ impl DocumentInstance {
         self.jump_history.jump_forward(current)
     }
 
-    fn load_page_text(&self, page_index: usize) -> Result<Arc<String>> {
-        if page_index >= self.info.page_count {
-            return Err(anyhow!("page {} out of range", page_index));
-        }
-
-        if let Some(text) = self.text_cache.lock().get(&page_index).cloned() {
-            return Ok(text);
-        }
-
-        let text = self.backend.page_text(page_index)?;
-        let text = Arc::new(text);
-        self.text_cache.lock().insert(page_index, Arc::clone(&text));
-        Ok(text)
-    }
-
-    fn build_search_matches(&self, query: &str) -> Result<Vec<SearchMatch>> {
-        let mut matches = Vec::new();
-
-        if query.is_empty() {
-            return Ok(matches);
-        }
-
-        let query_lower = query.to_lowercase();
-        let step = query_lower.len().max(1);
-
-        for page in 0..self.info.page_count {
-            let mut page_matches = match self.backend.search_page(page, query) {
-                Ok(rect_sets) => rect_sets,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        page,
-                        path = %self.info.path.display(),
-                        "backend search failed; falling back to text search"
-                    );
-                    Vec::new()
-                }
-            };
-
-            if !page_matches.is_empty() {
-                for rects in page_matches.drain(..) {
-                    let rects: Vec<NormalizedRect> = rects
-                        .into_iter()
-                        .map(|rect| rect.clamp())
-                        .filter(|rect| rect.is_valid())
-                        .collect();
-                    matches.push(SearchMatch { page, rects });
-                }
-                continue;
-            }
-
-            match self.load_page_text(page) {
-                Ok(text) => {
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    let lower = text.to_lowercase();
-                    let mut offset = 0usize;
-                    while offset < lower.len() {
-                        if let Some(pos) = lower[offset..].find(&query_lower) {
-                            let absolute = offset + pos;
-                            matches.push(SearchMatch {
-                                page,
-                                rects: Vec::new(),
-                            });
-                            let next = absolute.saturating_add(step);
-                            if next <= offset {
-                                break;
-                            }
-                            offset = next;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        page,
-                        path = %self.info.path.display(),
-                        "failed to extract text for search"
-                    );
-                }
-            }
-        }
-
-        Ok(matches)
-    }
-
     pub fn perform_search(&mut self, query: String) -> Result<bool> {
         let trimmed = query.trim().to_string();
 
@@ -658,8 +679,24 @@ impl DocumentInstance {
             return Ok(false);
         }
 
-        let matches = self.build_search_matches(&trimmed)?;
-        let start_page = self.state.current_page;
+        let context = self.search_context();
+        let matches = context.build_search_matches(&trimmed)?;
+        Ok(self.apply_search_results(trimmed, matches, self.state.current_page))
+    }
+
+    pub fn apply_search_results(
+        &mut self,
+        query: String,
+        matches: Vec<SearchMatch>,
+        start_page: usize,
+    ) -> bool {
+        if query.is_empty() {
+            self.search_state = None;
+            self.sync_jump_position();
+            return false;
+        }
+
+        let start_page = start_page.min(self.info.page_count.saturating_sub(1));
         let next_index = if matches.is_empty() {
             None
         } else {
@@ -672,16 +709,16 @@ impl DocumentInstance {
         };
 
         self.search_state = Some(SearchState {
-            query: trimmed,
+            query,
             matches,
             current_index: next_index,
         });
 
         if let Some(idx) = next_index {
-            Ok(self.apply_search_index(idx))
+            self.apply_search_index(idx)
         } else {
             self.sync_jump_position();
-            Ok(false)
+            false
         }
     }
 
@@ -1163,6 +1200,24 @@ impl Session {
     pub fn drain_events(&self) -> Vec<SessionEvent> {
         let mut events = self.events.lock();
         events.drain(..).collect()
+    }
+
+    pub fn apply_search_results(
+        &mut self,
+        doc_id: DocumentId,
+        query: String,
+        matches: Vec<SearchMatch>,
+        start_page: usize,
+    ) -> Result<bool> {
+        let Some(doc) = self.documents.iter_mut().find(|doc| doc.info.id == doc_id) else {
+            return Ok(false);
+        };
+
+        let changed = doc.apply_search_results(query, matches, start_page);
+        self.events
+            .lock()
+            .push(SessionEvent::RedrawNeeded(doc.info.id));
+        Ok(changed)
     }
 
     pub fn active(&self) -> Option<&DocumentInstance> {
