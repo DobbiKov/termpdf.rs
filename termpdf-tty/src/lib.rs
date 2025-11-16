@@ -714,6 +714,7 @@ mod tests {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Command(Command),
+    Commands(Vec<Command>),
     OpenTableOfContents,
     CloseOverlay,
     TocMoveSelection { delta: isize },
@@ -962,6 +963,10 @@ impl EventMapper {
             Event::Key(KeyEvent {
                 code, modifiers, ..
             }) => match (code, modifiers) {
+                (KeyCode::Char('q'), _) => {
+                    self.reset_count();
+                    UiEvent::CloseOverlay
+                }
                 (KeyCode::Esc, _) => {
                     self.reset_count();
                     UiEvent::CloseOverlay
@@ -1009,10 +1014,6 @@ impl EventMapper {
                 (KeyCode::Char('/'), KeyModifiers::NONE) => {
                     self.start_toc_search();
                     UiEvent::TocBeginSearch
-                }
-                (KeyCode::Char('q'), _) => {
-                    self.reset_count();
-                    UiEvent::Quit
                 }
                 _ => UiEvent::None,
             },
@@ -1112,9 +1113,10 @@ impl EventMapper {
                     UiEvent::Command(Command::LinkPrev { count })
                 }
                 (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    self.set_mode(InputMode::Normal);
                     self.reset_count();
                     self.reset_char_stack();
-                    UiEvent::Command(Command::ActivateLink)
+                    UiEvent::Commands(vec![Command::ActivateLink, Command::LeaveLinkMode])
                 }
                 _ => {
                     self.reset_count();
