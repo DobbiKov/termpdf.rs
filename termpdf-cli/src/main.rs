@@ -44,7 +44,7 @@ struct Args {
 }
 
 const FILE_POLL_INTERVAL_MS: u64 = 300;
-const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(2);
+const STATUS_MESSAGE_TTL: Duration = Duration::from_millis(1500);
 
 #[cfg(target_os = "macos")]
 const OPEN_COMMAND: &str = "open";
@@ -335,6 +335,8 @@ async fn main() -> Result<()> {
             dirty = true;
         }
 
+        status_bar.prune_expired();
+
         if dirty {
             // Begin an atomic update.
             renderer.begin_sync_update()?;
@@ -346,7 +348,13 @@ async fn main() -> Result<()> {
             }
 
             let pending = event_mapper.pending_input();
-            redraw(&mut renderer, &session, pending.as_deref(), &mut overlay)?;
+            redraw(
+                &mut renderer,
+                &session,
+                pending.as_deref(),
+                &mut overlay,
+                &status_bar,
+            )?;
 
             // End the atomic update. The terminal renders everything at once.
             renderer.end_sync_update()?;
@@ -369,7 +377,8 @@ async fn main() -> Result<()> {
                 }
             }
             let overlay_was_active = overlay.is_active();
-            let overlay_was_fullscreen = matches!(overlay, OverlayState::Toc(_)|OverlayState::Marks(_));
+            let overlay_was_fullscreen =
+                matches!(overlay, OverlayState::Toc(_) | OverlayState::Marks(_));
             match handle_event(
                 ui_event,
                 &mut session,
@@ -383,7 +392,8 @@ async fn main() -> Result<()> {
                 LoopAction::Quit => break,
             }
             watched_docs.retain(|entry| session.contains_document(entry.id));
-            let overlay_is_fullscreen = matches!(overlay, OverlayState::Toc(_)|OverlayState::Marks(_));
+            let overlay_is_fullscreen =
+                matches!(overlay, OverlayState::Toc(_) | OverlayState::Marks(_));
             if overlay.is_active() != overlay_was_active {
                 if overlay_is_fullscreen || overlay_was_fullscreen {
                     needs_initial_clear = true;
@@ -1436,6 +1446,7 @@ fn redraw(
     session: &Session,
     pending_input: Option<&str>,
     overlay: &mut OverlayState,
+    status_bar: &StatusBar,
 ) -> Result<()> {
     let window = terminal::window_size()?;
     let total_cols = u32::from(window.columns).max(1);
@@ -1581,9 +1592,15 @@ fn redraw(
         }
 
         renderer.draw(&display_image, DrawParams::clamped(draw_cols, draw_rows))?;
-        let status_text = format_document_status(doc);
-        if let Some(status) = combine_status(Some(status_text), pending_input) {
-            draw_status_line(renderer, &status)?;
+        if matches!(overlay, OverlayState::Command(_)) {
+            // Command overlay owns the status row; nothing else to draw here.
+        } else if let Some(message) = status_bar.message() {
+            draw_status_message(renderer, message)?;
+        } else {
+            let status_text = format_document_status(doc);
+            if let Some(status) = combine_status(Some(status_text), pending_input) {
+                draw_status_line(renderer, &status)?;
+            }
         }
 
         if let Err(err) = doc.prefetch_neighbors(2, render_scale) {
