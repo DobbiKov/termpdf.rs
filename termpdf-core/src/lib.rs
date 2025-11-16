@@ -130,6 +130,8 @@ pub struct PersistedDocumentState {
     pub dark_mode: bool,
     pub marks: HashMap<char, usize>,
     #[serde(default)]
+    pub named_marks: HashMap<String, usize>,
+    #[serde(default)]
     pub viewport: ViewportOffset,
 }
 
@@ -140,6 +142,7 @@ impl Default for PersistedDocumentState {
             scale: 1.0,
             dark_mode: false,
             marks: HashMap::new(),
+            named_marks: HashMap::new(),
             viewport: ViewportOffset::default(),
         }
     }
@@ -519,6 +522,9 @@ impl DocumentInstance {
         self.state
             .marks
             .retain(|_, page| *page < self.info.page_count);
+        self.state
+            .named_marks
+            .retain(|_, page| *page < self.info.page_count);
 
         if self.state.scale <= 1.0 + f32::EPSILON {
             self.state.viewport.reset();
@@ -543,6 +549,18 @@ impl DocumentInstance {
     }
     pub fn get_page_from_mark(&self, mark: char) -> Option<usize> {
         self.state.marks.get(&mark).map(|v| *v)
+    }
+
+    pub fn add_named_mark(&mut self, name: String, page: usize) {
+        self.state.named_marks.insert(name, page);
+    }
+
+    pub fn named_mark_page(&self, name: &str) -> Option<usize> {
+        self.state.named_marks.get(name).copied()
+    }
+
+    pub fn named_marks(&self) -> &HashMap<String, usize> {
+        &self.state.named_marks
     }
 
     pub fn prefetch_neighbors(&self, range: usize, scale: f32) -> Result<()> {
@@ -1074,6 +1092,8 @@ pub enum Command {
     AdjustViewport { delta_x: f32, delta_y: f32 },
     PutMark { key: char },
     GotoMark { key: char },
+    SaveNamedMark { name: String },
+    GotoNamedMark { name: String },
     Search { query: String },
     SearchNext { count: usize },
     SearchPrev { count: usize },
@@ -1302,6 +1322,28 @@ impl Session {
             Command::GotoMark { key } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     if let Some(page) = doc.get_page_from_mark(key) {
+                        let previous = doc.current_position();
+                        let next = page.min(doc.info.page_count.saturating_sub(1));
+                        if next != doc.state.current_page {
+                            doc.state.current_page = next;
+                            doc.state.viewport.reset();
+                            doc.record_jump_from(previous);
+                            self.events
+                                .lock()
+                                .push(SessionEvent::RedrawNeeded(doc.info.id));
+                        }
+                    }
+                }
+            }
+            Command::SaveNamedMark { name } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    let curr_page = doc.state.current_page;
+                    doc.add_named_mark(name, curr_page);
+                }
+            }
+            Command::GotoNamedMark { name } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if let Some(page) = doc.named_mark_page(&name) {
                         let previous = doc.current_position();
                         let next = page.min(doc.info.page_count.saturating_sub(1));
                         if next != doc.state.current_page {
@@ -1993,6 +2035,7 @@ mod tests {
         state.scale = 1.5;
         state.dark_mode = true;
         state.marks.insert('a', 1);
+        state.named_marks.insert("foo".into(), 2);
 
         store.save(&info, &state).unwrap();
 
@@ -2001,5 +2044,6 @@ mod tests {
         assert!(restored.dark_mode);
         assert_eq!(restored.scale, 1.5);
         assert_eq!(restored.marks.get(&'a'), Some(&1));
+        assert_eq!(restored.named_marks.get("foo"), Some(&2));
     }
 }

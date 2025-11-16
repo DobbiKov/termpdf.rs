@@ -887,9 +887,7 @@ impl EventMapper {
                     self.start_link_mode();
                     UiEvent::Command(Command::EnterLinkMode)
                 }
-                (KeyCode::Char(':'), mods)
-                    if mods.is_empty() || mods == KeyModifiers::SHIFT =>
-                {
+                (KeyCode::Char(':'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
                     self.set_mode(InputMode::Command);
                     let (buffer, cursor) = self.command_state_payload();
                     UiEvent::CommandModeBegin { buffer, cursor }
@@ -1181,9 +1179,7 @@ impl EventMapper {
                         UiEvent::None
                     }
                 }
-                (KeyCode::Char(c), mods)
-                    if mods.is_empty() || mods == KeyModifiers::SHIFT =>
-                {
+                (KeyCode::Char(c), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
                     if self.insert_command_char(c) {
                         let (buffer, cursor) = self.command_state_payload();
                         UiEvent::CommandModeChanged { buffer, cursor }
@@ -1329,8 +1325,7 @@ impl EventMapper {
         if self.command_cursor == 0 {
             return false;
         }
-        let prev_len = self
-            .command_buffer[..self.command_cursor]
+        let prev_len = self.command_buffer[..self.command_cursor]
             .chars()
             .next_back()
             .map(|c| c.len_utf8())
@@ -1345,8 +1340,7 @@ impl EventMapper {
         if self.command_cursor == 0 {
             return false;
         }
-        let shift = self
-            .command_buffer[..self.command_cursor]
+        let shift = self.command_buffer[..self.command_cursor]
             .chars()
             .next_back()
             .map(|c| c.len_utf8())
@@ -1362,8 +1356,7 @@ impl EventMapper {
         if self.command_cursor >= self.command_buffer.len() {
             return false;
         }
-        let shift = self
-            .command_buffer[self.command_cursor..]
+        let shift = self.command_buffer[self.command_cursor..]
             .chars()
             .next()
             .map(|c| c.len_utf8())
