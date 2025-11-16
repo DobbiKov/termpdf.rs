@@ -51,10 +51,17 @@ Flags:
 - `'<char>`: jump to a recorded mark.
 - `q`: quit.
 
+### Command Mode (`:`)
+- `:` opens a Vim-style prompt at the bottom of the screen. Type a command and hit `Enter`, `Esc` cancels.
+- `:q` / `:quit`: exit the viewer (same as pressing `q`).
+- `:mark <name>`: save a named mark for the current page; names can be quoted if they contain spaces (e.g. `:mark "Chapter 3"`).
+- `:goto <name>`: jump to a previously saved named mark.
+- `:listmarks`: toggle a floating window listing every named mark. Navigate it like the TOC (`j/k`, `g/G`, `Enter` to jump, `Esc` to close).
+
 A status line appears at the bottom showing the filename, current page, and any partially entered numeric prefix or command.
 
 ## Session Data
-State files are written under the platform data directory reported by `directories::ProjectDirs` (for example `~/.local/share/termpdf/state/` on Linux or `~/Library/Application Support/net.termpdf.termpdf/state/` on macOS). Document IDs are derived from the document's canonical path, so reopening the same file restores the last page, scale, dark-mode flag, and marks. Opening the file through a different path (e.g. a new symlink) generates a fresh session.
+State files are written under the platform data directory reported by `directories::ProjectDirs` (for example `~/.local/share/termpdf/state/` on Linux or `~/Library/Application Support/net.termpdf.termpdf/state/` on macOS). Document IDs are derived from the document's canonical path, so reopening the same file restores the last page, scale, dark-mode flag, and both single-character (`m<char>`) and named (`:mark foo`) marks. Opening the file through a different path (e.g. a new symlink) generates a fresh session.
 
 ## Project Layout
 - `termpdf-core`: document/session state machine, caching, and persistence helpers.
