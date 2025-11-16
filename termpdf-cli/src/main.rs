@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::cursor;
 use crossterm::event;
-use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
@@ -44,6 +44,7 @@ struct Args {
 }
 
 const FILE_POLL_INTERVAL_MS: u64 = 300;
+const STATUS_MESSAGE_TTL: Duration = Duration::from_millis(1500);
 
 #[cfg(target_os = "macos")]
 const OPEN_COMMAND: &str = "open";
@@ -240,12 +241,13 @@ async fn main() -> Result<()> {
     let mut renderer = KittyRenderer::new(stdout);
     let mut event_mapper = EventMapper::new();
     let mut overlay = OverlayState::None;
+    let mut status_bar = StatusBar::default();
     let mut dirty = true;
     let mut needs_initial_clear = true;
     let file_poll_interval = Duration::from_millis(FILE_POLL_INTERVAL_MS);
 
     loop {
-        if overlay.is_active() {
+        if overlay.requires_toc_mode() {
             if !matches!(event_mapper.mode(), InputMode::Toc | InputMode::TocSearch) {
                 event_mapper.set_mode(InputMode::Toc);
             }
@@ -292,6 +294,12 @@ async fn main() -> Result<()> {
                                 toc.entries = active.outline().to_vec();
                                 toc.update_selection_for_page(active.state.current_page);
                                 toc.rebuild_search_matches();
+                            } else if let OverlayState::Marks(window) = &mut overlay {
+                                if !window.rebuild(active) {
+                                    overlay.deactivate();
+                                } else {
+                                    window.update_current_page(active.state.current_page);
+                                }
                             }
                             needs_initial_clear = true;
                             dirty = true;
@@ -327,6 +335,8 @@ async fn main() -> Result<()> {
             dirty = true;
         }
 
+        status_bar.prune_expired();
+
         if dirty {
             // Begin an atomic update.
             renderer.begin_sync_update()?;
@@ -338,7 +348,13 @@ async fn main() -> Result<()> {
             }
 
             let pending = event_mapper.pending_input();
-            redraw(&mut renderer, &session, pending.as_deref(), &mut overlay)?;
+            redraw(
+                &mut renderer,
+                &session,
+                pending.as_deref(),
+                &mut overlay,
+                &status_bar,
+            )?;
 
             // End the atomic update. The terminal renders everything at once.
             renderer.end_sync_update()?;
@@ -350,28 +366,42 @@ async fn main() -> Result<()> {
             let ev = event::read()?;
             let ui_event = event_mapper.map_event(ev);
             let pending = event_mapper.pending_input();
+            status_bar.prune_expired();
             if !overlay.is_active() {
-                if let Some(status) = combine_status(document_status(&session), pending.as_deref())
+                if let Some(message) = status_bar.message() {
+                    draw_status_message(&mut renderer, message)?;
+                } else if let Some(status) =
+                    combine_status(document_status(&session), pending.as_deref())
                 {
                     draw_status_line(&mut renderer, &status)?;
                 }
             }
             let overlay_was_active = overlay.is_active();
+            let overlay_was_fullscreen =
+                matches!(overlay, OverlayState::Toc(_) | OverlayState::Marks(_));
             match handle_event(
                 ui_event,
                 &mut session,
                 &mut overlay,
                 &mut event_mapper,
                 &mut search_manager,
+                &mut status_bar,
             )? {
                 LoopAction::ContinueRedraw => dirty = true,
                 LoopAction::Continue => {}
                 LoopAction::Quit => break,
             }
             watched_docs.retain(|entry| session.contains_document(entry.id));
+            let overlay_is_fullscreen =
+                matches!(overlay, OverlayState::Toc(_) | OverlayState::Marks(_));
             if overlay.is_active() != overlay_was_active {
-                needs_initial_clear = true;
+                if overlay_is_fullscreen || overlay_was_fullscreen {
+                    needs_initial_clear = true;
+                }
                 dirty = true;
+            }
+            if overlay_is_fullscreen != overlay_was_fullscreen {
+                needs_initial_clear = true;
             }
         }
     }
@@ -394,6 +424,8 @@ enum LoopAction {
 enum OverlayState {
     None,
     Toc(TocWindow),
+    Command(CommandOverlay),
+    Marks(MarkWindow),
 }
 
 impl OverlayState {
@@ -403,6 +435,331 @@ impl OverlayState {
 
     fn is_active(&self) -> bool {
         !matches!(self, OverlayState::None)
+    }
+
+    fn requires_toc_mode(&self) -> bool {
+        matches!(self, OverlayState::Toc(_) | OverlayState::Marks(_))
+    }
+
+    fn is_command(&self) -> bool {
+        matches!(self, OverlayState::Command(_))
+    }
+
+    fn command_mut(&mut self) -> Option<&mut CommandOverlay> {
+        match self {
+            OverlayState::Command(cmd) => Some(cmd),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandOverlay {
+    buffer: String,
+    cursor: usize,
+    status: CommandStatus,
+}
+
+impl CommandOverlay {
+    fn new(buffer: String, cursor: usize) -> Self {
+        Self {
+            buffer,
+            cursor,
+            status: CommandStatus::default(),
+        }
+    }
+
+    fn update_input(&mut self, buffer: String, cursor: usize) {
+        let changed = self.buffer != buffer;
+        self.buffer = buffer;
+        self.cursor = self.buffer.len().min(cursor);
+        if changed && matches!(self.status.kind, CommandStatusKind::Error) {
+            self.status = CommandStatus::default();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_status(&mut self, status: CommandStatus) {
+        self.status = status;
+    }
+
+    fn visible_prompt(&self, max_cols: usize) -> (String, usize) {
+        if max_cols == 0 {
+            return (String::new(), 0);
+        }
+        let mut chars: Vec<char> = Vec::with_capacity(self.buffer.chars().count() + 1);
+        chars.push(':');
+        chars.extend(self.buffer.chars());
+        let cursor_chars = 1 + self
+            .buffer
+            .get(..self.cursor.min(self.buffer.len()))
+            .map(|segment| segment.chars().count())
+            .unwrap_or(0);
+        if chars.len() <= max_cols {
+            let display: String = chars.iter().collect();
+            return (display, cursor_chars.min(chars.len()));
+        }
+
+        let total = chars.len();
+        let mut start = if cursor_chars <= max_cols {
+            0
+        } else if cursor_chars >= total {
+            total.saturating_sub(max_cols)
+        } else {
+            cursor_chars.saturating_sub(max_cols)
+        };
+        if start + max_cols > total {
+            start = total.saturating_sub(max_cols);
+        }
+        let end = (start + max_cols).min(total);
+        let display: String = chars[start..end].iter().collect();
+        let cursor_in_view = cursor_chars.saturating_sub(start).min(max_cols);
+        (display, cursor_in_view)
+    }
+
+    fn write_status(&self, writer: &mut impl Write, available_cols: usize) -> io::Result<()> {
+        if available_cols == 0 || self.status.message.is_empty() {
+            return Ok(());
+        }
+        let text = truncate_with_ellipsis(self.status.message.clone(), available_cols);
+        match self.status.kind {
+            CommandStatusKind::Info => {}
+            CommandStatusKind::Error => {
+                crossterm::execute!(writer, SetForegroundColor(Color::Red))?;
+            }
+            CommandStatusKind::Progress => {
+                crossterm::execute!(writer, SetForegroundColor(Color::Yellow))?;
+            }
+        }
+        write!(writer, "{}", text)?;
+        crossterm::execute!(writer, SetForegroundColor(Color::Reset))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandStatus {
+    message: String,
+    kind: CommandStatusKind,
+}
+
+impl CommandStatus {
+    fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CommandStatusKind::Info,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CommandStatusKind::Error,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn progress(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: CommandStatusKind::Progress,
+        }
+    }
+}
+
+impl Default for CommandStatus {
+    fn default() -> Self {
+        CommandStatus::info("Command mode")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStatusKind {
+    Info,
+    Error,
+    Progress,
+}
+
+#[derive(Debug, Clone)]
+struct MarkEntry {
+    name: String,
+    page: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MarkWindow {
+    entries: Vec<MarkEntry>,
+    selected: usize,
+    current_index: Option<usize>,
+    scroll_offset: usize,
+}
+
+impl MarkWindow {
+    fn from_document(doc: &DocumentInstance) -> Option<Self> {
+        if doc.named_marks().is_empty() {
+            return None;
+        }
+        let mut entries: Vec<MarkEntry> = doc
+            .named_marks()
+            .iter()
+            .map(|(name, page)| MarkEntry {
+                name: name.clone(),
+                page: *page,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let current_page = doc.state.current_page;
+        let current_index = entries.iter().position(|entry| entry.page == current_page);
+        let selected = current_index.unwrap_or(0);
+        Some(Self {
+            entries,
+            selected,
+            current_index,
+            scroll_offset: 0,
+        })
+    }
+
+    fn rebuild(&mut self, doc: &DocumentInstance) -> bool {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        let Some(mut next_window) = Self::from_document(doc) else {
+            return false;
+        };
+        if let Some(name) = selected_name {
+            if let Some(idx) = next_window
+                .entries
+                .iter()
+                .position(|entry| entry.name == name)
+            {
+                next_window.selected = idx;
+            }
+        }
+        next_window.scroll_offset = self
+            .scroll_offset
+            .min(next_window.entries.len().saturating_sub(1));
+        *self = next_window;
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn entries_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn selected_entry(&self) -> Option<&MarkEntry> {
+        self.entries.get(self.selected)
+    }
+
+    fn current_index(&self) -> Option<usize> {
+        self.current_index.filter(|&idx| idx < self.entries.len())
+    }
+
+    fn update_current_page(&mut self, page: usize) {
+        self.current_index = self.entries.iter().position(|entry| entry.page == page);
+    }
+
+    fn set_selected(&mut self, index: usize) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let clamped = index.min(self.entries.len().saturating_sub(1));
+        if clamped != self.selected {
+            self.selected = clamped;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let len = self.entries.len() as isize;
+        let next = (self.selected as isize + delta).clamp(0, len - 1) as usize;
+        self.set_selected(next)
+    }
+
+    fn select_first(&mut self) -> bool {
+        self.set_selected(0)
+    }
+
+    fn select_last(&mut self) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.set_selected(self.entries.len() - 1)
+    }
+
+    fn ensure_visible(&mut self, viewport_height: usize) {
+        if viewport_height == 0 || self.entries.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        let max_offset = self.entries.len().saturating_sub(viewport_height.max(1));
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+            return;
+        }
+        let bottom = self.scroll_offset + viewport_height;
+        if self.selected >= bottom {
+            self.scroll_offset = self
+                .selected
+                .saturating_sub(viewport_height.saturating_sub(1));
+        }
+    }
+}
+
+struct StatusMessage {
+    text: String,
+    kind: CommandStatusKind,
+    expires_at: Option<Instant>,
+}
+
+impl StatusMessage {
+    fn new(text: impl Into<String>, kind: CommandStatusKind, ttl: Option<Duration>) -> Self {
+        let expires_at = ttl.map(|ttl| Instant::now() + ttl);
+        Self {
+            text: text.into(),
+            kind,
+            expires_at,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(deadline) => Instant::now() >= deadline,
+            None => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct StatusBar {
+    message: Option<StatusMessage>,
+}
+
+impl StatusBar {
+    fn set_message(&mut self, message: StatusMessage) {
+        self.message = Some(message);
+    }
+
+    fn message(&self) -> Option<&StatusMessage> {
+        self.message.as_ref()
+    }
+
+    fn prune_expired(&mut self) {
+        if let Some(message) = &self.message {
+            if message.is_expired() {
+                self.message = None;
+            }
+        }
     }
 }
 
@@ -669,6 +1026,7 @@ fn handle_event(
     overlay: &mut OverlayState,
     mapper: &mut EventMapper,
     search_manager: &mut SearchManager,
+    status_bar: &mut StatusBar,
 ) -> Result<LoopAction> {
     match event {
         UiEvent::BeginSearch => Ok(LoopAction::Continue),
@@ -683,6 +1041,142 @@ fn handle_event(
         UiEvent::SearchCancel => {
             handle_search_input(String::new(), session, search_manager)?;
             Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::CommandModeBegin { buffer, cursor } => {
+            *overlay = OverlayState::Command(CommandOverlay::new(buffer, cursor));
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::CommandModeChanged { buffer, cursor } => {
+            if let Some(command) = overlay.command_mut() {
+                command.update_input(buffer, cursor);
+                Ok(LoopAction::ContinueRedraw)
+            } else {
+                Ok(LoopAction::Continue)
+            }
+        }
+        UiEvent::CommandModeCancel => {
+            if overlay.is_command() {
+                overlay.deactivate();
+                Ok(LoopAction::ContinueRedraw)
+            } else {
+                Ok(LoopAction::Continue)
+            }
+        }
+        UiEvent::CommandModeSubmit { command } => {
+            let trimmed = command.trim().to_string();
+            if !trimmed.is_empty() {
+                mapper.push_command_history(&trimmed);
+            }
+            overlay.deactivate();
+            if trimmed.is_empty() {
+                return Ok(LoopAction::ContinueRedraw);
+            }
+
+            let tokens = tokenize_command(&trimmed);
+            if tokens.is_empty() {
+                return Ok(LoopAction::ContinueRedraw);
+            }
+            let command_name = tokens[0].to_ascii_lowercase();
+            match command_name.as_str() {
+                "q" | "quit" => Ok(LoopAction::Quit),
+                "mark" => {
+                    if tokens.len() < 2 {
+                        status_bar.set_message(StatusMessage::new(
+                            "Usage: :mark <name>",
+                            CommandStatusKind::Error,
+                            Some(STATUS_MESSAGE_TTL),
+                        ));
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                    if session.active().is_none() {
+                        status_bar.set_message(StatusMessage::new(
+                            "No active document",
+                            CommandStatusKind::Error,
+                            Some(STATUS_MESSAGE_TTL),
+                        ));
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                    let name = tokens[1].clone();
+                    let page = session
+                        .active()
+                        .map(|doc| doc.state.current_page)
+                        .unwrap_or(0);
+                    session.apply(Command::SaveNamedMark { name: name.clone() })?;
+                    refresh_mark_overlay(overlay, session, mapper);
+                    status_bar.set_message(StatusMessage::new(
+                        format!("Saved mark '{}' at page {}", name, page + 1),
+                        CommandStatusKind::Info,
+                        Some(STATUS_MESSAGE_TTL),
+                    ));
+                    Ok(LoopAction::ContinueRedraw)
+                }
+                "goto" => {
+                    if tokens.len() < 2 {
+                        status_bar.set_message(StatusMessage::new(
+                            "Usage: :goto <name>",
+                            CommandStatusKind::Error,
+                            Some(STATUS_MESSAGE_TTL),
+                        ));
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                    let name = tokens[1].clone();
+                    let target_page = session.active().and_then(|doc| doc.named_mark_page(&name));
+                    let Some(page) = target_page else {
+                        status_bar.set_message(StatusMessage::new(
+                            format!("Unknown mark '{}'", name),
+                            CommandStatusKind::Error,
+                            Some(STATUS_MESSAGE_TTL),
+                        ));
+                        return Ok(LoopAction::ContinueRedraw);
+                    };
+                    session.apply(Command::GotoNamedMark { name: name.clone() })?;
+                    refresh_mark_overlay(overlay, session, mapper);
+                    status_bar.set_message(StatusMessage::new(
+                        format!("Jumped to mark '{}' (page {})", name, page + 1),
+                        CommandStatusKind::Info,
+                        Some(STATUS_MESSAGE_TTL),
+                    ));
+                    Ok(LoopAction::ContinueRedraw)
+                }
+                "listmarks" => {
+                    if matches!(overlay, OverlayState::Marks(_)) {
+                        overlay.deactivate();
+                        mapper.set_mode(InputMode::Normal);
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                    let Some(doc) = session.active() else {
+                        status_bar.set_message(StatusMessage::new(
+                            "No active document",
+                            CommandStatusKind::Error,
+                            Some(STATUS_MESSAGE_TTL),
+                        ));
+                        return Ok(LoopAction::ContinueRedraw);
+                    };
+                    match MarkWindow::from_document(doc) {
+                        Some(window) => {
+                            *overlay = OverlayState::Marks(window);
+                            mapper.set_mode(InputMode::Toc);
+                            Ok(LoopAction::ContinueRedraw)
+                        }
+                        None => {
+                            status_bar.set_message(StatusMessage::new(
+                                "No marks saved",
+                                CommandStatusKind::Info,
+                                Some(STATUS_MESSAGE_TTL),
+                            ));
+                            Ok(LoopAction::ContinueRedraw)
+                        }
+                    }
+                }
+                _ => {
+                    status_bar.set_message(StatusMessage::new(
+                        format!("Undefined command: {}", trimmed),
+                        CommandStatusKind::Error,
+                        Some(STATUS_MESSAGE_TTL),
+                    ));
+                    Ok(LoopAction::ContinueRedraw)
+                }
+            }
         }
         UiEvent::Command(cmd) => {
             let mut redraw = matches!(
@@ -713,6 +1207,9 @@ fn handle_event(
                 Command::CloseDocument { .. } | Command::SwitchDocument { .. }
             );
 
+            let mark_saved = matches!(&cmd, Command::SaveNamedMark { .. });
+            let mark_goto = matches!(&cmd, Command::GotoNamedMark { .. });
+
             session.apply(cmd)?;
             let event_redraw = process_session_events(session);
             redraw = redraw || event_redraw;
@@ -720,12 +1217,36 @@ fn handle_event(
             if resets_overlay {
                 overlay.deactivate();
                 mapper.set_mode(InputMode::Normal);
-            } else if let OverlayState::Toc(toc) = overlay {
-                if let Some(doc) = session.active() {
-                    toc.update_selection_for_page(doc.state.current_page);
-                } else {
-                    overlay.deactivate();
-                    mapper.set_mode(InputMode::Normal);
+            } else {
+                match overlay {
+                    OverlayState::Toc(toc) => {
+                        if let Some(doc) = session.active() {
+                            toc.update_selection_for_page(doc.state.current_page);
+                        } else {
+                            overlay.deactivate();
+                            mapper.set_mode(InputMode::Normal);
+                        }
+                    }
+                    OverlayState::Marks(window) => {
+                        if mark_saved {
+                            if let Some(doc) = session.active() {
+                                if !window.rebuild(doc) {
+                                    overlay.deactivate();
+                                    mapper.set_mode(InputMode::Normal);
+                                } else {
+                                    window.update_current_page(doc.state.current_page);
+                                }
+                            } else {
+                                overlay.deactivate();
+                                mapper.set_mode(InputMode::Normal);
+                            }
+                        } else if mark_goto {
+                            if let Some(doc) = session.active() {
+                                window.update_current_page(doc.state.current_page);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -756,10 +1277,18 @@ fn handle_event(
             }
         }
         UiEvent::TocMoveSelection { delta } => {
-            if let OverlayState::Toc(toc) = overlay {
-                if toc.move_selection(delta) {
-                    return Ok(LoopAction::ContinueRedraw);
+            match overlay {
+                OverlayState::Toc(toc) => {
+                    if toc.move_selection(delta) {
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
                 }
+                OverlayState::Marks(window) => {
+                    if window.move_selection(delta) {
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                }
+                _ => {}
             }
             Ok(LoopAction::Continue)
         }
@@ -813,32 +1342,62 @@ fn handle_event(
             Ok(LoopAction::Continue)
         }
         UiEvent::TocGotoStart => {
-            if let OverlayState::Toc(toc) = overlay {
-                if toc.select_first() {
-                    return Ok(LoopAction::ContinueRedraw);
+            match overlay {
+                OverlayState::Toc(toc) => {
+                    if toc.select_first() {
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
                 }
+                OverlayState::Marks(window) => {
+                    if window.select_first() {
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                }
+                _ => {}
             }
             Ok(LoopAction::Continue)
         }
         UiEvent::TocGotoEnd => {
-            if let OverlayState::Toc(toc) = overlay {
-                if toc.select_last() {
-                    return Ok(LoopAction::ContinueRedraw);
+            match overlay {
+                OverlayState::Toc(toc) => {
+                    if toc.select_last() {
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
                 }
+                OverlayState::Marks(window) => {
+                    if window.select_last() {
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                }
+                _ => {}
             }
             Ok(LoopAction::Continue)
         }
         UiEvent::TocActivateSelection => {
-            if let OverlayState::Toc(toc) = overlay {
-                if let Some(entry) = toc.selected_entry() {
-                    session.apply(Command::GotoPage {
-                        page: entry.page_index,
-                    })?;
-                    let _ = process_session_events(session);
-                    overlay.deactivate();
-                    mapper.set_mode(InputMode::Normal);
-                    return Ok(LoopAction::ContinueRedraw);
+            match overlay {
+                OverlayState::Toc(toc) => {
+                    if let Some(entry) = toc.selected_entry() {
+                        session.apply(Command::GotoPage {
+                            page: entry.page_index,
+                        })?;
+                        let _ = process_session_events(session);
+                        overlay.deactivate();
+                        mapper.set_mode(InputMode::Normal);
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
                 }
+                OverlayState::Marks(window) => {
+                    if let Some(entry) = window.selected_entry() {
+                        session.apply(Command::GotoNamedMark {
+                            name: entry.name.clone(),
+                        })?;
+                        let _ = process_session_events(session);
+                        overlay.deactivate();
+                        mapper.set_mode(InputMode::Normal);
+                        return Ok(LoopAction::ContinueRedraw);
+                    }
+                }
+                _ => {}
             }
             Ok(LoopAction::Continue)
         }
@@ -887,6 +1446,7 @@ fn redraw(
     session: &Session,
     pending_input: Option<&str>,
     overlay: &mut OverlayState,
+    status_bar: &StatusBar,
 ) -> Result<()> {
     let window = terminal::window_size()?;
     let total_cols = u32::from(window.columns).max(1);
@@ -896,12 +1456,18 @@ fn redraw(
     let image_rows_available = total_rows.saturating_sub(1).max(1);
 
     if let Some(doc) = session.active() {
-        if overlay.is_active() {
+        if matches!(overlay, OverlayState::Toc(_) | OverlayState::Marks(_)) {
             {
                 let mut writer = renderer.writer();
                 crossterm::execute!(&mut writer, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
             }
-            draw_overlay(renderer, overlay, total_cols, image_rows_available)?;
+            draw_overlay(
+                renderer,
+                overlay,
+                total_cols,
+                total_rows,
+                image_rows_available,
+            )?;
             return Ok(());
         }
 
@@ -1026,9 +1592,15 @@ fn redraw(
         }
 
         renderer.draw(&display_image, DrawParams::clamped(draw_cols, draw_rows))?;
-        let status_text = format_document_status(doc);
-        if let Some(status) = combine_status(Some(status_text), pending_input) {
-            draw_status_line(renderer, &status)?;
+        if matches!(overlay, OverlayState::Command(_)) {
+            // Command overlay owns the status row; nothing else to draw here.
+        } else if let Some(message) = status_bar.message() {
+            draw_status_message(renderer, message)?;
+        } else {
+            let status_text = format_document_status(doc);
+            if let Some(status) = combine_status(Some(status_text), pending_input) {
+                draw_status_line(renderer, &status)?;
+            }
         }
 
         if let Err(err) = doc.prefetch_neighbors(2, render_scale) {
@@ -1039,7 +1611,13 @@ fn redraw(
             );
         }
 
-        draw_overlay(renderer, overlay, total_cols, image_rows_available)?;
+        draw_overlay(
+            renderer,
+            overlay,
+            total_cols,
+            total_rows,
+            image_rows_available,
+        )?;
     } else {
         overlay.deactivate();
     }
@@ -1078,16 +1656,179 @@ fn draw_status_line(renderer: &mut KittyRenderer<io::Stdout>, status: &str) -> R
     Ok(())
 }
 
+fn draw_status_message(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    message: &StatusMessage,
+) -> Result<()> {
+    let window = terminal::window_size()?;
+    let total_cols = u32::from(window.columns).max(1) as usize;
+    let total_rows = u32::from(window.rows).max(1);
+    let status_row = total_rows.saturating_sub(1);
+    let mut writer = renderer.writer();
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(0, status_row as u16),
+        Clear(ClearType::CurrentLine)
+    )?;
+    let clipped = truncate_with_ellipsis(message.text.clone(), total_cols);
+    let color = match message.kind {
+        CommandStatusKind::Info => Color::White,
+        CommandStatusKind::Error => Color::Red,
+        CommandStatusKind::Progress => Color::Yellow,
+    };
+    crossterm::execute!(&mut writer, SetForegroundColor(color))?;
+    write!(writer, "{}", clipped)?;
+    crossterm::execute!(&mut writer, SetForegroundColor(Color::Reset))?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn draw_overlay(
     renderer: &mut KittyRenderer<io::Stdout>,
     overlay: &mut OverlayState,
     total_cols: u32,
+    total_rows: u32,
     image_rows_available: u32,
 ) -> Result<()> {
     match overlay {
-        OverlayState::Toc(toc) => draw_toc_overlay(renderer, toc, total_cols, image_rows_available),
-        OverlayState::None => Ok(()),
+        OverlayState::Toc(toc) => {
+            {
+                let mut writer = renderer.writer();
+                crossterm::execute!(&mut writer, cursor::Hide)?;
+            }
+            draw_toc_overlay(renderer, toc, total_cols, image_rows_available)
+        }
+        OverlayState::Marks(window) => {
+            {
+                let mut writer = renderer.writer();
+                crossterm::execute!(&mut writer, cursor::Hide)?;
+            }
+            draw_marks_overlay(renderer, window, total_cols, image_rows_available)
+        }
+        OverlayState::Command(command) => {
+            draw_command_overlay(renderer, command, total_cols, total_rows)
+        }
+        OverlayState::None => {
+            let mut writer = renderer.writer();
+            crossterm::execute!(&mut writer, cursor::Hide)?;
+            Ok(())
+        }
     }
+}
+
+fn draw_command_overlay(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    overlay: &CommandOverlay,
+    total_cols: u32,
+    total_rows: u32,
+) -> Result<()> {
+    if total_cols == 0 || total_rows == 0 {
+        return Ok(());
+    }
+    let status_row = total_rows.saturating_sub(1);
+    let max_cols = total_cols as usize;
+    let mut writer = renderer.writer();
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(0, status_row as u16),
+        Clear(ClearType::CurrentLine)
+    )?;
+
+    if max_cols == 0 {
+        crossterm::execute!(&mut writer, cursor::Show)?;
+        return Ok(());
+    }
+
+    let (prompt, cursor_col) = overlay.visible_prompt(max_cols);
+    write!(writer, "{}", prompt)?;
+    let mut used_cols = prompt.chars().count().min(max_cols);
+
+    if used_cols < max_cols {
+        write!(writer, " ")?;
+        used_cols = (used_cols + 1).min(max_cols);
+    }
+
+    if used_cols < max_cols {
+        let available = max_cols - used_cols;
+        overlay.write_status(&mut writer, available)?;
+    }
+
+    let cursor_limit = max_cols.saturating_sub(1);
+    let cursor_position = cursor_col.min(cursor_limit) as u16;
+    crossterm::execute!(
+        &mut writer,
+        cursor::MoveTo(cursor_position, status_row as u16),
+        cursor::Show
+    )?;
+
+    Ok(())
+}
+
+fn refresh_mark_overlay(overlay: &mut OverlayState, session: &Session, mapper: &mut EventMapper) {
+    if let OverlayState::Marks(window) = overlay {
+        if let Some(doc) = session.active() {
+            if !window.rebuild(doc) {
+                overlay.deactivate();
+                mapper.set_mode(InputMode::Normal);
+            } else {
+                window.update_current_page(doc.state.current_page);
+            }
+        } else {
+            overlay.deactivate();
+            mapper.set_mode(InputMode::Normal);
+        }
+    }
+}
+
+fn tokenize_command(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                continue;
+            }
+            if ch == q {
+                tokens.push(current.clone());
+                current.clear();
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                quote = Some(ch);
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+            }
+            c => current.push(c),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    } else if quote.is_some() {
+        tokens.push(String::new());
+    }
+
+    tokens
 }
 
 fn draw_toc_overlay(
@@ -1241,6 +1982,134 @@ fn draw_toc_overlay(
     Ok(())
 }
 
+fn draw_marks_overlay(
+    renderer: &mut KittyRenderer<io::Stdout>,
+    marks: &mut MarkWindow,
+    total_cols: u32,
+    image_rows_available: u32,
+) -> Result<()> {
+    const TITLE: &str = "Marks";
+    const EMPTY_MESSAGE: &str = "No marks saved";
+
+    if total_cols < 20 || image_rows_available < 4 {
+        return Ok(());
+    }
+
+    if marks.is_empty() {
+        return Ok(());
+    }
+
+    let max_inner_width = total_cols.saturating_sub(6) as usize;
+    if max_inner_width < 10 {
+        return Ok(());
+    }
+
+    let base_width = marks
+        .entries
+        .iter()
+        .map(mark_line_length)
+        .max()
+        .unwrap_or(EMPTY_MESSAGE.len())
+        .max(TITLE.len());
+
+    let mut inner_width = base_width.min(max_inner_width);
+    let min_inner_width = 20.min(max_inner_width);
+    if inner_width < min_inner_width {
+        inner_width = min_inner_width;
+    }
+
+    let max_window_height = image_rows_available.saturating_sub(2);
+    if max_window_height < 5 {
+        return Ok(());
+    }
+
+    let header_rows = 3u32;
+    if max_window_height < header_rows {
+        return Ok(());
+    }
+
+    let total_entries = marks.entries_len().max(1);
+    let max_content_height = max_window_height.saturating_sub(header_rows) as usize;
+    let content_height = total_entries.min(max_content_height).max(1);
+    marks.ensure_visible(content_height);
+    let max_scroll = total_entries.saturating_sub(content_height);
+    if marks.scroll_offset > max_scroll {
+        marks.scroll_offset = max_scroll;
+    }
+
+    let window_height = (content_height as u32).saturating_add(header_rows);
+    if window_height > max_window_height {
+        return Ok(());
+    }
+    let window_width = (inner_width + 2) as u32;
+    if window_width > total_cols {
+        return Ok(());
+    }
+
+    let start_col = (total_cols.saturating_sub(window_width)) / 2;
+    let start_row = (image_rows_available.saturating_sub(window_height)) / 2;
+
+    let mut writer = renderer.writer();
+    let mut current_row = start_row as u16;
+    let start_col_u16 = start_col as u16;
+    let horizontal_border = "-".repeat(inner_width);
+
+    print_inverted(
+        &mut writer,
+        start_col_u16,
+        current_row,
+        &format!("+{}+", horizontal_border),
+        false,
+    )?;
+    current_row = current_row.saturating_add(1);
+
+    let title = truncate_with_ellipsis(format!(" {TITLE}"), inner_width);
+    let title_line = format!("|{}|", title);
+    print_inverted(&mut writer, start_col_u16, current_row, &title_line, false)?;
+    current_row = current_row.saturating_add(1);
+
+    let separator = format!("+{}+", horizontal_border);
+    print_inverted(&mut writer, start_col_u16, current_row, &separator, false)?;
+    current_row = current_row.saturating_add(1);
+
+    let start_index = marks.scroll_offset;
+    let end_index = (start_index + content_height).min(marks.entries_len());
+    for idx in start_index..end_index {
+        let entry = &marks.entries[idx];
+        let selected = idx == marks.selected;
+        let current = marks
+            .current_index()
+            .map(|current| current == idx)
+            .unwrap_or(false);
+        let content = format_mark_line(entry, selected, current, inner_width);
+        let line = format!("|{}|", content);
+        print_inverted(
+            &mut writer,
+            start_col_u16,
+            current_row,
+            &line,
+            selected || current,
+        )?;
+        current_row = current_row.saturating_add(1);
+    }
+
+    for _ in end_index..(start_index + content_height) {
+        let line = format!("|{}|", " ".repeat(inner_width));
+        print_inverted(&mut writer, start_col_u16, current_row, &line, false)?;
+        current_row = current_row.saturating_add(1);
+    }
+
+    print_inverted(
+        &mut writer,
+        start_col_u16,
+        current_row,
+        &format!("+{}+", horizontal_border),
+        false,
+    )?;
+
+    Ok(())
+}
+
 fn print_inverted(
     writer: &mut impl Write,
     col: u16,
@@ -1326,6 +2195,29 @@ fn highlight_search_segment(title: &str, query: Option<&str>) -> String {
     title.to_string()
 }
 
+fn mark_line_length(entry: &MarkEntry) -> usize {
+    let name_len = entry.name.len();
+    let suffix = format!(" (p{})", entry.page + 1);
+    4 + name_len + suffix.len()
+}
+
+fn format_mark_line(
+    entry: &MarkEntry,
+    selected: bool,
+    current: bool,
+    inner_width: usize,
+) -> String {
+    let selected_marker = if selected { '>' } else { ' ' };
+    let current_marker = if current { '*' } else { ' ' };
+    let mut text = String::new();
+    text.push(selected_marker);
+    text.push(current_marker);
+    text.push(' ');
+    text.push_str(&entry.name);
+    text.push_str(&format!(" (p{})", entry.page + 1));
+    truncate_with_ellipsis(text, inner_width)
+}
+
 fn find_ascii_match_range(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     if needle.is_empty() {
         return None;
@@ -1409,6 +2301,18 @@ mod tests {
         assert!(toc.search_query.is_none());
         assert!(toc.search_matches.is_empty());
         assert!(toc.search_prompt().is_none());
+    }
+
+    #[test]
+    fn tokenize_command_supports_quotes() {
+        let tokens = tokenize_command("mark 'foo bar' \"baz\"");
+        assert_eq!(tokens, vec!["mark", "foo bar", "baz"]);
+    }
+
+    #[test]
+    fn tokenize_command_handles_escaping() {
+        let tokens = tokenize_command("mark 'foo\\'bar'");
+        assert_eq!(tokens, vec!["mark", "foo'bar"]);
     }
 }
 
