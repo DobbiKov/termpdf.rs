@@ -415,6 +415,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum LoopAction {
     Continue,
     ContinueRedraw,
@@ -1177,6 +1178,34 @@ fn handle_event(
                     Ok(LoopAction::ContinueRedraw)
                 }
             }
+        }
+        UiEvent::Commands(commands) => {
+            let mut ret_act = LoopAction::Continue;
+            for command in commands {
+                let action = handle_event(
+                    UiEvent::Command(command),
+                    session,
+                    overlay,
+                    mapper,
+                    search_manager,
+                    status_bar,
+                );
+                match action {
+                    Err(_) => {
+                        return action;
+                    }
+                    Ok(loop_action) => match loop_action {
+                        LoopAction::Quit => {
+                            return action;
+                        }
+                        LoopAction::ContinueRedraw => {
+                            ret_act = loop_action;
+                        }
+                        _ => {}
+                    },
+                };
+            }
+            Ok(ret_act)
         }
         UiEvent::Command(cmd) => {
             let mut redraw = matches!(
