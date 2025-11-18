@@ -9,7 +9,8 @@ use parking_lot::Mutex;
 use pdfium_render::prelude::*;
 use termpdf_core::{
     document_id_for_path, DocumentBackend, DocumentInfo, DocumentMetadata, DocumentProvider,
-    LinkAction, LinkDefinition, NormalizedRect, OutlineItem, RenderImage, RenderRequest,
+    LinkAction, LinkDefinition, NormalizedRect, OutlineItem, PageText, RenderImage, RenderRequest,
+    TextGlyph,
 };
 use tracing::{instrument, warn};
 
@@ -224,7 +225,7 @@ impl DocumentBackend for PdfiumDocument {
         Ok(outline)
     }
 
-    fn page_text(&self, page_index: usize) -> Result<String> {
+    fn page_text(&self, page_index: usize) -> Result<PageText> {
         self.with_document(|document| {
             let page_index: PdfPageIndex = page_index
                 .try_into()
@@ -233,10 +234,41 @@ impl DocumentBackend for PdfiumDocument {
                 .pages()
                 .get(page_index)
                 .with_context(|| format!("page {} out of range", page_index))?;
-            let text = page
+
+            let text_page = page
                 .text()
                 .with_context(|| format!("failed to extract text for page {}", page_index))?;
-            Ok(text.all())
+            let page_width = page.width().value;
+            let page_height = page.height().value;
+            if page_width <= 0.0 || page_height <= 0.0 {
+                return Ok(PageText::new(String::new(), Vec::new()));
+            }
+
+            let mut buffer = String::new();
+            let mut glyphs = Vec::new();
+            for ch in text_page.chars().iter() {
+                let value = ch.unicode_char().unwrap_or(' ');
+                let start = buffer.len();
+                buffer.push(value);
+                let end = buffer.len();
+                let rect = ch
+                    .tight_bounds()
+                    .or_else(|_| ch.loose_bounds())
+                    .ok()
+                    .and_then(|bounds| normalize_pdf_rect(&bounds, page_width, page_height))
+                    .unwrap_or(NormalizedRect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                    });
+                glyphs.push(TextGlyph {
+                    range: start..end,
+                    rect,
+                });
+            }
+
+            Ok(PageText::new(buffer, glyphs))
         })
     }
 
@@ -416,6 +448,30 @@ fn build_document_info(pdfium: &Pdfium, path: &Path) -> Result<DocumentInfo> {
             keywords,
         },
     })
+}
+
+fn normalize_pdf_rect(rect: &PdfRect, page_width: f32, page_height: f32) -> Option<NormalizedRect> {
+    if page_width <= 0.0 || page_height <= 0.0 {
+        return None;
+    }
+    let left = (rect.left().value / page_width).clamp(0.0, 1.0);
+    let right = (rect.right().value / page_width).clamp(0.0, 1.0);
+    let top_ratio = rect.top().value / page_height;
+    let bottom_ratio = rect.bottom().value / page_height;
+    let top = (1.0 - top_ratio).clamp(0.0, 1.0);
+    let bottom = (1.0 - bottom_ratio).clamp(0.0, 1.0);
+    let rect = NormalizedRect {
+        left,
+        top,
+        right,
+        bottom,
+    }
+    .clamp();
+    if rect.is_valid() {
+        Some(rect)
+    } else {
+        None
+    }
 }
 
 fn invert_pixels(pixels: &mut [u8]) {

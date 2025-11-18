@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
+use arboard::Clipboard;
 use clap::Parser;
 use crossterm::cursor;
 use crossterm::event;
@@ -15,10 +16,14 @@ use crossterm::terminal::{self, Clear, ClearType};
 use directories::ProjectDirs;
 use termpdf_core::{
     Command, DocumentId, DocumentInstance, ExternalLink, FileStateStore, Highlights,
-    NormalizedRect, OutlineItem, RenderImage, SearchMatch, Session, SessionEvent, StateStore,
+    NormalizedRect, OutlineItem, RenderImage, SearchMatch, SelectionMotion, Session, SessionEvent,
+    StateStore,
 };
 use termpdf_render::PdfRenderFactory;
-use termpdf_tty::{write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent};
+use termpdf_tty::{
+    write_status_line, DrawParams, EventMapper, InputMode, KittyRenderer, UiEvent,
+    VisualMotion as TtyVisualMotion,
+};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task;
@@ -1179,6 +1184,65 @@ fn handle_event(
                 }
             }
         }
+        UiEvent::BeginVisualMode => {
+            session.apply(Command::EnterVisualMode)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualStartSelection => {
+            session.apply(Command::StartSelection)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualMotion { motion, count } => {
+            let mapped = map_visual_motion(motion);
+            session.apply(Command::MoveVisualCursor {
+                motion: mapped,
+                count,
+            })?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualYank => {
+            match session.selection_text() {
+                Some(text) => match copy_text_to_clipboard(&text) {
+                    Ok(_) => status_bar.set_message(StatusMessage::new(
+                        "Yanked selection",
+                        CommandStatusKind::Info,
+                        Some(STATUS_MESSAGE_TTL),
+                    )),
+                    Err(err) => status_bar.set_message(StatusMessage::new(
+                        format!("Clipboard error: {}", err),
+                        CommandStatusKind::Error,
+                        Some(STATUS_MESSAGE_TTL),
+                    )),
+                },
+                None => {
+                    status_bar.set_message(StatusMessage::new(
+                        "No active selection",
+                        CommandStatusKind::Error,
+                        Some(STATUS_MESSAGE_TTL),
+                    ));
+                    return Ok(LoopAction::ContinueRedraw);
+                }
+            }
+            session.apply(Command::LeaveVisualMode)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualClearSelection => {
+            session.apply(Command::ClearSelection)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualCancel => {
+            session.apply(Command::LeaveVisualMode)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualReselectLast => {
+            session.apply(Command::EnterVisualMode)?;
+            session.apply(Command::RestoreSelection)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
+        UiEvent::VisualSwapCursor => {
+            session.apply(Command::SwapVisualCursor)?;
+            Ok(LoopAction::ContinueRedraw)
+        }
         UiEvent::Commands(commands) => {
             let mut ret_act = LoopAction::Continue;
             for command in commands {
@@ -1509,6 +1573,7 @@ fn redraw(
         let mut render_scale = base_scale;
         let search_highlights = doc.search_highlights_for_current_page();
         let link_highlights = doc.link_highlights_for_current_page();
+        let selection_highlights = doc.selection_highlights_for_current_page();
         let mut image = doc.render_with_scale(base_scale)?;
         let mut highlight_geom = HighlightGeometry::new(image.width, image.height);
 
@@ -1616,8 +1681,39 @@ fn redraw(
             )?;
         }
 
-        if let Some(highlights) = link_highlights.as_ref().or(search_highlights.as_ref()) {
-            apply_highlights(&mut display_image, highlights, &highlight_geom);
+        if let Some(highlights) = link_highlights.as_ref() {
+            apply_highlights(
+                &mut display_image,
+                highlights,
+                &highlight_geom,
+                &SEARCH_HIGHLIGHT_PALETTE,
+            );
+        }
+        if let Some(highlights) = search_highlights.as_ref() {
+            apply_highlights(
+                &mut display_image,
+                highlights,
+                &highlight_geom,
+                &SEARCH_HIGHLIGHT_PALETTE,
+            );
+        }
+        if let Some(highlights) = selection_highlights.as_ref() {
+            apply_highlights(
+                &mut display_image,
+                highlights,
+                &highlight_geom,
+                &SELECTION_HIGHLIGHT_PALETTE,
+            );
+        }
+        if let Some(rect) = doc.visual_cursor_highlight() {
+            let mut cursor_highlight = Highlights::default();
+            cursor_highlight.current.push(rect);
+            apply_highlights(
+                &mut display_image,
+                &cursor_highlight,
+                &highlight_geom,
+                &CURSOR_HIGHLIGHT_PALETTE,
+            );
         }
 
         renderer.draw(&display_image, DrawParams::clamped(draw_cols, draw_rows))?;
@@ -2451,6 +2547,30 @@ fn compute_viewport_origin(total: u32, viewport: u32, fraction: f32) -> u32 {
     raw.max(0.0).min(max_offset as f32) as u32
 }
 
+fn map_visual_motion(motion: TtyVisualMotion) -> SelectionMotion {
+    match motion {
+        TtyVisualMotion::Left => SelectionMotion::Left,
+        TtyVisualMotion::Right => SelectionMotion::Right,
+        TtyVisualMotion::Up => SelectionMotion::Up,
+        TtyVisualMotion::Down => SelectionMotion::Down,
+        TtyVisualMotion::WordForward => SelectionMotion::WordForward,
+        TtyVisualMotion::WordBackward => SelectionMotion::WordBackward,
+        TtyVisualMotion::LineStart => SelectionMotion::LineStart,
+        TtyVisualMotion::LineEnd => SelectionMotion::LineEnd,
+        TtyVisualMotion::DocumentStart => SelectionMotion::DocumentStart,
+        TtyVisualMotion::DocumentEnd => SelectionMotion::DocumentEnd,
+        TtyVisualMotion::PageForward => SelectionMotion::PageForward,
+        TtyVisualMotion::PageBackward => SelectionMotion::PageBackward,
+    }
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("clipboard unavailable")?;
+    clipboard
+        .set_text(text.to_string())
+        .context("failed to copy selection")
+}
+
 fn crop_render_image(
     image: &RenderImage,
     origin_x: u32,
@@ -2540,7 +2660,40 @@ struct PixelRect {
     y1: u32,
 }
 
-fn apply_highlights(image: &mut RenderImage, highlights: &Highlights, geom: &HighlightGeometry) {
+struct HighlightPalette {
+    current_fill: [u8; 3],
+    current_alpha: f32,
+    current_stroke: [u8; 3],
+    other_stroke: [u8; 3],
+}
+
+const SEARCH_HIGHLIGHT_PALETTE: HighlightPalette = HighlightPalette {
+    current_fill: [255, 235, 0],
+    current_alpha: 0.35,
+    current_stroke: [255, 235, 0],
+    other_stroke: [255, 200, 0],
+};
+
+const SELECTION_HIGHLIGHT_PALETTE: HighlightPalette = HighlightPalette {
+    current_fill: [0, 200, 255],
+    current_alpha: 0.35,
+    current_stroke: [0, 200, 255],
+    other_stroke: [0, 150, 220],
+};
+
+const CURSOR_HIGHLIGHT_PALETTE: HighlightPalette = HighlightPalette {
+    current_fill: [180, 180, 255],
+    current_alpha: 0.25,
+    current_stroke: [180, 180, 255],
+    other_stroke: [180, 180, 255],
+};
+
+fn apply_highlights(
+    image: &mut RenderImage,
+    highlights: &Highlights,
+    geom: &HighlightGeometry,
+    palette: &HighlightPalette,
+) {
     if image.width == 0 || image.height == 0 {
         return;
     }
@@ -2561,11 +2714,11 @@ fn apply_highlights(image: &mut RenderImage, highlights: &Highlights, geom: &Hig
         .collect();
 
     for rect in other_rects {
-        stroke_rect(image, rect, [255, 200, 0]);
+        stroke_rect(image, rect, palette.other_stroke);
     }
     for rect in current_rects {
-        fill_rect(image, rect, [255, 235, 0], 0.35);
-        stroke_rect(image, rect, [255, 235, 0]);
+        fill_rect(image, rect, palette.current_fill, palette.current_alpha);
+        stroke_rect(image, rect, palette.current_stroke);
     }
 }
 

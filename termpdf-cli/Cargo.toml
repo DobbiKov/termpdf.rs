@@ -18,3 +18,4 @@ termpdf-core = { path = "../termpdf-core" }
 termpdf-render = { path = "../termpdf-render" }
 termpdf-tty = { path = "../termpdf-tty" }
 url = "2"
+arboard = "3.2"

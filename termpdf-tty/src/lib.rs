@@ -342,6 +342,85 @@ mod tests {
     }
 
     #[test]
+    fn event_mapper_v_enters_visual_mode() {
+        let mut mapper = EventMapper::new();
+        match mapper.map_event(key_event(KeyCode::Char('v'))) {
+            UiEvent::BeginVisualMode => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Visual);
+    }
+
+    #[test]
+    fn event_mapper_visual_esc_returns_to_normal() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Visual);
+        mapper.visual_selecting = true;
+        match mapper.map_event(key_event(KeyCode::Esc)) {
+            UiEvent::VisualClearSelection => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Visual);
+        match mapper.map_event(key_event(KeyCode::Esc)) {
+            UiEvent::VisualCancel => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Normal);
+    }
+
+    #[test]
+    fn event_mapper_visual_y_exits_and_emits_yank() {
+        let mut mapper = EventMapper::new();
+        mapper.set_mode(InputMode::Visual);
+        match mapper.map_event(key_event(KeyCode::Char('y'))) {
+            UiEvent::VisualYank => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Normal);
+    }
+
+    #[test]
+    fn event_mapper_second_v_starts_selection() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('v'))),
+            UiEvent::BeginVisualMode
+        ));
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('v'))),
+            UiEvent::VisualStartSelection
+        ));
+    }
+
+    #[test]
+    fn event_mapper_gv_reselects_last_visual_region() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('g'))),
+            UiEvent::None
+        ));
+        match mapper.map_event(key_event(KeyCode::Char('v'))) {
+            UiEvent::VisualReselectLast => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Visual);
+    }
+
+    #[test]
+    fn event_mapper_gg_goes_to_document_start() {
+        let mut mapper = EventMapper::new();
+        assert!(matches!(
+            mapper.map_event(key_event(KeyCode::Char('g'))),
+            UiEvent::None
+        ));
+        match mapper.map_event(key_event(KeyCode::Char('g'))) {
+            UiEvent::Command(Command::GotoPage { page }) => assert_eq!(page, 0),
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert_eq!(mapper.mode(), InputMode::Normal);
+    }
+
+    #[test]
     fn event_mapper_maps_ctrl_arrows_to_viewport_adjustment() {
         let mut mapper = EventMapper::new();
 
@@ -735,8 +814,32 @@ pub enum UiEvent {
     CommandModeChanged { buffer: String, cursor: usize },
     CommandModeSubmit { command: String },
     CommandModeCancel,
+    BeginVisualMode,
+    VisualMotion { motion: VisualMotion, count: usize },
+    VisualStartSelection,
+    VisualClearSelection,
+    VisualYank,
+    VisualCancel,
+    VisualReselectLast,
+    VisualSwapCursor,
     Quit,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordForward,
+    WordBackward,
+    LineStart,
+    LineEnd,
+    DocumentStart,
+    DocumentEnd,
+    PageForward,
+    PageBackward,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,6 +850,7 @@ pub enum InputMode {
     Search,
     Link,
     Command,
+    Visual,
 }
 
 impl Default for InputMode {
@@ -768,6 +872,7 @@ pub struct EventMapper {
     command_history: Vec<String>,
     command_history_index: Option<usize>,
     command_draft: String,
+    visual_selecting: bool,
 }
 
 impl EventMapper {
@@ -789,6 +894,9 @@ impl EventMapper {
             if matches!(self.mode, InputMode::Command) {
                 self.reset_command_input();
             }
+            if matches!(self.mode, InputMode::Visual) {
+                self.visual_selecting = false;
+            }
             self.reset_count();
             self.reset_char_stack();
             self.mode = mode;
@@ -800,6 +908,9 @@ impl EventMapper {
             }
             if matches!(self.mode, InputMode::Command) {
                 self.reset_command_input();
+            }
+            if matches!(self.mode, InputMode::Visual) {
+                self.visual_selecting = false;
             }
         }
     }
@@ -816,6 +927,7 @@ impl EventMapper {
             InputMode::Search => self.map_event_search(event),
             InputMode::Link => self.map_event_link(event),
             InputMode::Command => self.map_event_command(event),
+            InputMode::Visual => self.map_event_visual(event),
         }
     }
 
@@ -937,8 +1049,33 @@ impl EventMapper {
                     UiEvent::Command(Command::ToggleDarkMode)
                 }
                 (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    if self.char_stack.as_str() == "g" {
+                        self.reset_count();
+                        self.reset_char_stack();
+                        UiEvent::Command(Command::GotoPage { page: 0 })
+                    } else {
+                        self.reset_count();
+                        if self.char_stack.is_empty() {
+                            self.push_char('g');
+                        } else {
+                            self.reset_char_stack();
+                        }
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Char('v'), KeyModifiers::NONE) => {
                     self.reset_count();
-                    UiEvent::Command(Command::GotoPage { page: 0 })
+                    if self.char_stack.as_str() == "g" {
+                        self.reset_char_stack();
+                        self.set_mode(InputMode::Visual);
+                        self.visual_selecting = true;
+                        UiEvent::VisualReselectLast
+                    } else {
+                        self.reset_char_stack();
+                        self.set_mode(InputMode::Visual);
+                        self.visual_selecting = false;
+                        UiEvent::BeginVisualMode
+                    }
                 }
                 (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => {
                     self.reset_count();
@@ -1116,7 +1253,7 @@ impl EventMapper {
                     self.set_mode(InputMode::Normal);
                     self.reset_count();
                     self.reset_char_stack();
-                    UiEvent::Commands(vec![Command::ActivateLink, Command::LeaveLinkMode])
+                    UiEvent::Command(Command::ActivateLink)
                 }
                 _ => {
                     self.reset_count();
@@ -1195,6 +1332,119 @@ impl EventMapper {
         }
     }
 
+    fn map_event_visual(&mut self, event: Event) -> UiEvent {
+        match event {
+            Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    if self.visual_selecting {
+                        self.visual_selecting = false;
+                        UiEvent::VisualClearSelection
+                    } else {
+                        self.set_mode(InputMode::Normal);
+                        UiEvent::VisualCancel
+                    }
+                }
+                (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                    self.reset_count();
+                    self.reset_char_stack();
+                    if self.visual_selecting {
+                        UiEvent::None
+                    } else {
+                        self.visual_selecting = true;
+                        UiEvent::VisualStartSelection
+                    }
+                }
+                (KeyCode::Char('y'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.set_mode(InputMode::Normal);
+                    self.reset_char_stack();
+                    let _ = self.take_count();
+                    self.visual_selecting = false;
+                    UiEvent::VisualYank
+                }
+                (KeyCode::Char('o'), KeyModifiers::NONE) => {
+                    self.reset_char_stack();
+                    self.reset_count();
+                    UiEvent::VisualSwapCursor
+                }
+                (KeyCode::Char(c), KeyModifiers::NONE)
+                    if c.is_ascii_digit() && (c != '0' || self.pending_count.is_some()) =>
+                {
+                    if let Some(digit) = c.to_digit(10) {
+                        self.push_digit(digit as usize);
+                    }
+                    UiEvent::None
+                }
+                (KeyCode::Char('0'), KeyModifiers::NONE) if self.pending_count.is_none() => {
+                    self.visual_motion(VisualMotion::LineStart)
+                }
+                (KeyCode::Char('^'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.visual_motion(VisualMotion::LineStart)
+                }
+                (KeyCode::Char('$'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.visual_motion(VisualMotion::LineEnd)
+                }
+                (KeyCode::Char('h'), KeyModifiers::NONE)
+                | (KeyCode::Char('H'), KeyModifiers::SHIFT)
+                | (KeyCode::Left, KeyModifiers::NONE) => self.visual_motion(VisualMotion::Left),
+                (KeyCode::Char('l'), KeyModifiers::NONE)
+                | (KeyCode::Char('L'), KeyModifiers::SHIFT)
+                | (KeyCode::Right, KeyModifiers::NONE) => self.visual_motion(VisualMotion::Right),
+                (KeyCode::Char('j'), KeyModifiers::NONE)
+                | (KeyCode::Char('J'), KeyModifiers::SHIFT)
+                | (KeyCode::Down, KeyModifiers::NONE) => self.visual_motion(VisualMotion::Down),
+                (KeyCode::Char('k'), KeyModifiers::NONE)
+                | (KeyCode::Char('K'), KeyModifiers::SHIFT)
+                | (KeyCode::Up, KeyModifiers::NONE) => self.visual_motion(VisualMotion::Up),
+                (KeyCode::Char('w'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.visual_motion(VisualMotion::WordForward)
+                }
+                (KeyCode::Char('b'), mods) if mods.is_empty() || mods == KeyModifiers::SHIFT => {
+                    self.visual_motion(VisualMotion::WordBackward)
+                }
+                (KeyCode::Char('G'), KeyModifiers::SHIFT) | (KeyCode::End, _) => {
+                    self.visual_motion(VisualMotion::DocumentEnd)
+                }
+                (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    if self.char_stack.as_str() == "g" {
+                        self.visual_motion(VisualMotion::DocumentStart)
+                    } else {
+                        if self.char_stack.is_empty() {
+                            self.push_char('g');
+                        } else {
+                            self.reset_char_stack();
+                        }
+                        UiEvent::None
+                    }
+                }
+                (KeyCode::Home, _) => self.visual_motion(VisualMotion::DocumentStart),
+                (KeyCode::PageDown, _) => self.visual_motion(VisualMotion::PageForward),
+                (KeyCode::Char('f'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.visual_motion(VisualMotion::PageForward)
+                }
+                (KeyCode::Char('d'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.visual_motion(VisualMotion::PageForward)
+                }
+                (KeyCode::PageUp, _) => self.visual_motion(VisualMotion::PageBackward),
+                (KeyCode::Char('b'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.visual_motion(VisualMotion::PageBackward)
+                }
+                (KeyCode::Char('u'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.visual_motion(VisualMotion::PageBackward)
+                }
+                _ => {
+                    self.reset_char_stack();
+                    self.reset_count();
+                    UiEvent::None
+                }
+            },
+            _ => UiEvent::None,
+        }
+    }
+
     fn push_digit(&mut self, digit: usize) {
         let current = self.pending_count.unwrap_or(0);
         let next = current.saturating_mul(10).saturating_add(digit);
@@ -1260,6 +1510,12 @@ impl EventMapper {
             delta_x: delta_x * multiplier,
             delta_y: delta_y * multiplier,
         })
+    }
+
+    fn visual_motion(&mut self, motion: VisualMotion) -> UiEvent {
+        let count = self.take_count();
+        self.reset_char_stack();
+        UiEvent::VisualMotion { motion, count }
     }
 
     pub fn pending_input(&self) -> Option<String> {

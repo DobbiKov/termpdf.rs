@@ -41,7 +41,7 @@ Flags:
 ### Viewer Controls
 - `j` / `↓`: next page (`12j` works for counts).
 - `k` / `↑`: previous page.
-- `g`: jump to the first page.
+- `gg`: jump to the first page.
 - `G` / `End`: jump to the last page.
 - `+` / `-`: zoom in/out (clamped between 0.25x and 4x; auto-fit may request a higher scale when there is space).
 - `=`: reset zoom to 100%.
@@ -49,7 +49,10 @@ Flags:
 - `d`: toggle dark-mode inversion.
 - `m<char>`: record a mark for the active page.
 - `'<char>`: jump to a recorded mark.
+- `v`: enter Visual mode to select text. The first `v` shows a movable cursor, the second `v` begins the selection. Move with Vim motions (`h/j/k/l`, counts, `w`, `b`, `0`, `^`, `$`, etc.); crossing page boundaries automatically flips pages. `y` yanks to the clipboard and exits, `gv` reselects the previous selection, `Esc` clears the selection the first time and exits on the second.
 - `q`: quit.
+
+Visual yanks use the system clipboard via [`arboard`](https://crates.io/crates/arboard), so a compatible clipboard service must be available on the host platform.
 
 ### Command Mode (`:`)
 - `:` opens a Vim-style prompt at the bottom of the screen. Type a command and hit `Enter`, `Esc` cancels.

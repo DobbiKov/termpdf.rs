@@ -1,6 +1,8 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -121,6 +123,101 @@ pub struct RenderImage {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextGlyph {
+    pub range: Range<usize>,
+    pub rect: NormalizedRect,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageText {
+    pub text: String,
+    pub glyphs: Vec<TextGlyph>,
+    boundary_offsets: Vec<usize>,
+    line_map: Vec<PageLine>,
+    glyph_line_index: Vec<usize>,
+}
+
+impl PageText {
+    pub fn new(text: String, glyphs: Vec<TextGlyph>) -> Self {
+        let mut boundary_offsets = Vec::with_capacity(glyphs.len().saturating_add(1));
+        boundary_offsets.push(0);
+        for glyph in &glyphs {
+            boundary_offsets.push(glyph.range.end.min(text.len()));
+        }
+        let (line_map, glyph_line_index) = build_line_map(&glyphs);
+        Self {
+            text,
+            glyphs,
+            boundary_offsets,
+            line_map,
+            glyph_line_index,
+        }
+    }
+
+    pub fn glyph_count(&self) -> usize {
+        self.glyphs.len()
+    }
+
+    pub fn boundary_offset(&self, boundary: usize) -> usize {
+        if boundary >= self.boundary_offsets.len() {
+            return self.text.len();
+        }
+        self.boundary_offsets[boundary]
+    }
+
+    pub fn line_index_for_glyph(&self, index: usize) -> Option<usize> {
+        self.glyph_line_index.get(index).copied()
+    }
+
+    pub fn line(&self, index: usize) -> Option<&PageLine> {
+        self.line_map.get(index)
+    }
+
+    pub fn glyph_char(&self, index: usize) -> Option<char> {
+        let glyph = self.glyphs.get(index)?;
+        self.text[glyph.range.clone()].chars().next()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PageLine {
+    pub glyph_range: Range<usize>,
+    pub center_y: f32,
+}
+
+fn build_line_map(glyphs: &[TextGlyph]) -> (Vec<PageLine>, Vec<usize>) {
+    if glyphs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut lines = Vec::new();
+    let mut glyph_line_index = Vec::with_capacity(glyphs.len());
+    let mut last_center: Option<f32> = None;
+    let threshold = 0.015;
+
+    for (idx, glyph) in glyphs.iter().enumerate() {
+        let center = (glyph.rect.top + glyph.rect.bottom) * 0.5;
+        let new_line = match last_center {
+            Some(prev) => (prev - center).abs() > threshold,
+            None => true,
+        };
+        if new_line {
+            lines.push(PageLine {
+                glyph_range: idx..idx,
+                center_y: center,
+            });
+        }
+        if let Some(line) = lines.last_mut() {
+            line.glyph_range.end = idx + 1;
+            line.center_y = (line.center_y * 0.8) + (center * 0.2);
+            glyph_line_index.push(lines.len() - 1);
+        }
+        last_center = Some(center);
+    }
+
+    (lines, glyph_line_index)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +399,16 @@ impl NormalizedRect {
     pub fn is_valid(&self) -> bool {
         self.right > self.left && self.bottom > self.top
     }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+
+    pub fn center(&self) -> (f32, f32) {
+        let cx = (self.left + self.right) * 0.5;
+        let cy = (self.top + self.bottom) * 0.5;
+        (cx, cy)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -325,6 +432,22 @@ enum SearchDirection {
     Backward,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum SelectionMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordForward,
+    WordBackward,
+    LineStart,
+    LineEnd,
+    DocumentStart,
+    DocumentEnd,
+    PageForward,
+    PageBackward,
+}
+
 #[derive(Debug, Clone)]
 struct LinkEntry {
     page: usize,
@@ -338,6 +461,53 @@ struct LinkState {
     current_index: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionPoint {
+    page: usize,
+    glyph_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionState {
+    anchor: SelectionPoint,
+    head: SelectionPoint,
+}
+
+#[derive(Debug, Clone)]
+struct SelectionSnapshot {
+    start: SelectionPoint,
+    end: SelectionPoint,
+}
+
+impl SelectionState {
+    fn normalized(&self) -> SelectionSnapshot {
+        if compare_points(self.anchor, self.head) == Ordering::Greater {
+            SelectionSnapshot {
+                start: self.head,
+                end: self.anchor,
+            }
+        } else {
+            SelectionSnapshot {
+                start: self.anchor,
+                end: self.head,
+            }
+        }
+    }
+}
+
+impl SelectionSnapshot {
+    fn points(&self) -> (SelectionPoint, SelectionPoint) {
+        (self.start, self.end)
+    }
+}
+
+fn compare_points(a: SelectionPoint, b: SelectionPoint) -> Ordering {
+    match a.page.cmp(&b.page) {
+        Ordering::Equal => a.glyph_index.cmp(&b.glyph_index),
+        other => other,
+    }
+}
+
 pub struct DocumentInstance {
     pub info: DocumentInfo,
     pub backend: Arc<dyn DocumentBackend>,
@@ -345,32 +515,25 @@ pub struct DocumentInstance {
     render_cache: Mutex<HashMap<CacheKey, RenderImage>>,
     outline: Vec<OutlineItem>,
     jump_history: JumpHistory,
-    text_cache: Arc<Mutex<HashMap<usize, Arc<String>>>>,
+    text_cache: Arc<Mutex<HashMap<usize, Arc<PageText>>>>,
     search_state: Option<SearchState>,
     link_state: Option<LinkState>,
+    selection_state: Option<SelectionState>,
+    visual_cursor: Option<SelectionPoint>,
+    last_selection: Option<SelectionSnapshot>,
+    visual_column_hint: f32,
 }
 
 #[derive(Clone)]
 pub struct DocumentSearchContext {
     info: DocumentInfo,
     backend: Arc<dyn DocumentBackend>,
-    text_cache: Arc<Mutex<HashMap<usize, Arc<String>>>>,
+    text_cache: Arc<Mutex<HashMap<usize, Arc<PageText>>>>,
 }
 
 impl DocumentSearchContext {
-    fn load_page_text(&self, page_index: usize) -> Result<Arc<String>> {
-        if page_index >= self.info.page_count {
-            return Err(anyhow!("page {} out of range", page_index));
-        }
-
-        if let Some(text) = self.text_cache.lock().get(&page_index).cloned() {
-            return Ok(text);
-        }
-
-        let text = self.backend.page_text(page_index)?;
-        let text = Arc::new(text);
-        self.text_cache.lock().insert(page_index, Arc::clone(&text));
-        Ok(text)
+    fn load_page_text(&self, page_index: usize) -> Result<Arc<PageText>> {
+        load_cached_page_text(page_index, &self.info, &self.backend, &self.text_cache)
     }
 
     pub fn build_search_matches(&self, query: &str) -> Result<Vec<SearchMatch>> {
@@ -410,12 +573,12 @@ impl DocumentSearchContext {
             }
 
             match self.load_page_text(page) {
-                Ok(text) => {
-                    if text.is_empty() {
+                Ok(page_text) => {
+                    if page_text.text.is_empty() {
                         continue;
                     }
 
-                    let lower = text.to_lowercase();
+                    let lower = page_text.text.to_lowercase();
                     let mut offset = 0usize;
                     while offset < lower.len() {
                         if let Some(pos) = lower[offset..].find(&query_lower) {
@@ -449,7 +612,587 @@ impl DocumentSearchContext {
     }
 }
 
+fn load_cached_page_text(
+    page_index: usize,
+    info: &DocumentInfo,
+    backend: &Arc<dyn DocumentBackend>,
+    cache: &Arc<Mutex<HashMap<usize, Arc<PageText>>>>,
+) -> Result<Arc<PageText>> {
+    if page_index >= info.page_count {
+        return Err(anyhow!("page {} out of range", page_index));
+    }
+
+    if let Some(text) = cache.lock().get(&page_index).cloned() {
+        return Ok(text);
+    }
+
+    let text = Arc::new(backend.page_text(page_index)?);
+    cache.lock().insert(page_index, Arc::clone(&text));
+    Ok(text)
+}
+
+fn glyph_near_point(text: &PageText, x: f32, y: f32) -> usize {
+    if text.glyphs.is_empty() {
+        return 0;
+    }
+    let mut best_index = 0usize;
+    let mut best_score = f32::MAX;
+    for (idx, glyph) in text.glyphs.iter().enumerate() {
+        let rect = &glyph.rect;
+        if rect.is_valid() && rect.contains(x, y) {
+            return idx;
+        }
+        if rect.is_valid() {
+            let (cx, cy) = rect.center();
+            let dx = cx - x;
+            let dy = cy - y;
+            let score = dx * dx + dy * dy;
+            if score < best_score {
+                best_score = score;
+                best_index = idx;
+            }
+        }
+    }
+    best_index
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 impl DocumentInstance {
+    fn page_text_entry(&self, page_index: usize) -> Result<Arc<PageText>> {
+        load_cached_page_text(page_index, &self.info, &self.backend, &self.text_cache)
+    }
+
+    fn ensure_visual_cursor(&mut self) -> Result<bool> {
+        if let Some(point) = self.visual_cursor {
+            let clamped = self.clamp_point(point)?;
+            if clamped != point {
+                self.visual_cursor = Some(clamped);
+                self.update_column_hint(clamped);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if self.info.page_count == 0 {
+            return Ok(false);
+        }
+        let point = self.initial_cursor_point()?;
+        self.visual_cursor = Some(point);
+        self.update_column_hint(point);
+        Ok(true)
+    }
+
+    fn start_selection(&mut self) -> Result<bool> {
+        if self.selection_state.is_some() {
+            return Ok(false);
+        }
+        self.ensure_visual_cursor()?;
+        let Some(point) = self.visual_cursor else {
+            return Ok(false);
+        };
+        self.selection_state = Some(SelectionState {
+            anchor: point,
+            head: point,
+        });
+        Ok(true)
+    }
+
+    fn initial_cursor_point(&self) -> Result<SelectionPoint> {
+        if let Some(point) = self.visual_cursor {
+            return self.clamp_point(point);
+        }
+        let page = self
+            .state
+            .current_page
+            .min(self.info.page_count.saturating_sub(1));
+        let page_text = self.page_text_entry(page)?;
+        let glyph_index = if page_text.glyphs.is_empty() {
+            0
+        } else {
+            glyph_near_point(&page_text, self.state.viewport.x, self.state.viewport.y)
+        };
+        Ok(SelectionPoint { page, glyph_index })
+    }
+
+    fn update_column_hint(&mut self, point: SelectionPoint) {
+        if let Some((x, _)) = self.cursor_center(point) {
+            self.visual_column_hint = x;
+        }
+    }
+
+    fn cursor_center(&self, point: SelectionPoint) -> Option<(f32, f32)> {
+        let page_text = self.page_text_entry(point.page).ok()?;
+        let glyph_count = page_text.glyph_count();
+        if glyph_count == 0 {
+            return None;
+        }
+        let idx = point.glyph_index.min(glyph_count.saturating_sub(1));
+        let glyph = page_text.glyphs.get(idx)?;
+        if glyph.rect.is_valid() {
+            Some(glyph.rect.center())
+        } else {
+            None
+        }
+    }
+
+    fn clamp_point(&self, mut point: SelectionPoint) -> Result<SelectionPoint> {
+        if self.info.page_count == 0 {
+            point.page = 0;
+            point.glyph_index = 0;
+            return Ok(point);
+        }
+        if point.page >= self.info.page_count {
+            point.page = self.info.page_count - 1;
+        }
+        let page_text = self.page_text_entry(point.page)?;
+        let limit = page_text.glyph_count();
+        point.glyph_index = point.glyph_index.min(limit);
+        Ok(point)
+    }
+
+    fn increment_point(&self, point: &mut SelectionPoint) -> Result<bool> {
+        let page_text = self.page_text_entry(point.page)?;
+        if point.glyph_index < page_text.glyph_count() {
+            point.glyph_index += 1;
+            return Ok(true);
+        }
+        if point.page + 1 < self.info.page_count {
+            point.page += 1;
+            point.glyph_index = 0;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn decrement_point(&self, point: &mut SelectionPoint) -> Result<bool> {
+        if point.glyph_index > 0 {
+            point.glyph_index -= 1;
+            return Ok(true);
+        }
+        if point.page == 0 {
+            return Ok(false);
+        }
+        point.page -= 1;
+        let prev_text = self.page_text_entry(point.page)?;
+        point.glyph_index = prev_text.glyph_count();
+        Ok(true)
+    }
+
+    fn adjust_point(&self, point: &mut SelectionPoint, delta: isize) -> Result<bool> {
+        if delta == 0 {
+            return Ok(false);
+        }
+        let mut moved = false;
+        if delta > 0 {
+            for _ in 0..delta {
+                if !self.increment_point(point)? {
+                    break;
+                }
+                moved = true;
+            }
+        } else {
+            for _ in 0..(-delta) {
+                if !self.decrement_point(point)? {
+                    break;
+                }
+                moved = true;
+            }
+        }
+        Ok(moved)
+    }
+
+    fn move_pages(&self, point: &mut SelectionPoint, delta: isize) -> Result<bool> {
+        if delta == 0 || self.info.page_count == 0 {
+            return Ok(false);
+        }
+        let mut target = point.page as isize + delta;
+        let max_page = (self.info.page_count.saturating_sub(1)) as isize;
+        target = target.clamp(0, max_page);
+        if target as usize == point.page {
+            return Ok(false);
+        }
+        point.page = target as usize;
+        let page_text = self.page_text_entry(point.page)?;
+        point.glyph_index = point.glyph_index.min(page_text.glyph_count());
+        Ok(true)
+    }
+
+    fn move_lines(&self, point: &mut SelectionPoint, delta: isize) -> Result<bool> {
+        if delta == 0 {
+            return Ok(false);
+        }
+        let mut remaining = delta;
+        let mut moved = false;
+        while remaining != 0 {
+            let page_text = self.page_text_entry(point.page)?;
+            if page_text.line_map.is_empty() {
+                if remaining > 0 {
+                    if point.page + 1 >= self.info.page_count {
+                        break;
+                    }
+                    point.page += 1;
+                    point.glyph_index = 0;
+                    remaining -= 1;
+                    moved = true;
+                } else {
+                    if point.page == 0 {
+                        break;
+                    }
+                    point.page -= 1;
+                    point.glyph_index = 0;
+                    remaining += 1;
+                    moved = true;
+                }
+                continue;
+            }
+            let glyph_count = page_text.glyph_count();
+            let idx = if glyph_count == 0 {
+                0
+            } else {
+                point.glyph_index.min(glyph_count.saturating_sub(1))
+            };
+            let mut line_idx = page_text
+                .line_index_for_glyph(idx)
+                .unwrap_or_else(|| page_text.line_map.len().saturating_sub(1));
+            if remaining > 0 {
+                if line_idx + 1 < page_text.line_map.len() {
+                    line_idx += 1;
+                    point.glyph_index = page_text.line_map[line_idx].glyph_range.start;
+                    remaining -= 1;
+                    moved = true;
+                } else {
+                    if point.page + 1 >= self.info.page_count {
+                        break;
+                    }
+                    point.page += 1;
+                    point.glyph_index = 0;
+                    remaining -= 1;
+                    moved = true;
+                }
+            } else {
+                if line_idx > 0 {
+                    line_idx -= 1;
+                    point.glyph_index = page_text.line_map[line_idx].glyph_range.start;
+                    remaining += 1;
+                    moved = true;
+                } else {
+                    if point.page == 0 {
+                        break;
+                    }
+                    point.page -= 1;
+                    if let Some(prev_line) = self.page_text_entry(point.page)?.line_map.last() {
+                        point.glyph_index = prev_line.glyph_range.start;
+                    } else {
+                        point.glyph_index = 0;
+                    }
+                    remaining += 1;
+                    moved = true;
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    fn move_word(&self, point: &mut SelectionPoint, count: usize, forward: bool) -> Result<bool> {
+        let mut moved = false;
+        let steps = count.max(1);
+        for _ in 0..steps {
+            moved |= self.skip_while(point, |ch| !is_word_char(ch), forward)?;
+            moved |= self.skip_while(point, |ch| is_word_char(ch), forward)?;
+        }
+        Ok(moved)
+    }
+
+    fn move_to_line_boundary(&self, point: &mut SelectionPoint, to_start: bool) -> Result<bool> {
+        let page_text = self.page_text_entry(point.page)?;
+        if page_text.line_map.is_empty() {
+            return Ok(false);
+        }
+        let glyph_count = page_text.glyph_count();
+        let idx = if glyph_count == 0 {
+            0
+        } else {
+            point.glyph_index.min(glyph_count.saturating_sub(1))
+        };
+        let line_idx = page_text
+            .line_index_for_glyph(idx)
+            .unwrap_or_else(|| page_text.line_map.len().saturating_sub(1));
+        let target_index = if to_start {
+            page_text.line_map[line_idx].glyph_range.start
+        } else {
+            page_text.line_map[line_idx]
+                .glyph_range
+                .end
+                .min(glyph_count)
+        };
+        if point.glyph_index == target_index {
+            return Ok(false);
+        }
+        point.glyph_index = target_index;
+        Ok(true)
+    }
+
+    fn skip_while<F>(&self, point: &mut SelectionPoint, predicate: F, forward: bool) -> Result<bool>
+    where
+        F: Fn(char) -> bool,
+    {
+        let mut changed = false;
+        loop {
+            let page_text = self.page_text_entry(point.page)?;
+            let glyph_count = page_text.glyph_count();
+            if forward {
+                if point.glyph_index >= glyph_count {
+                    if !self.increment_point(point)? {
+                        break;
+                    }
+                    changed = true;
+                    continue;
+                }
+                match page_text.glyph_char(point.glyph_index) {
+                    Some(ch) if predicate(ch) => {
+                        if !self.increment_point(point)? {
+                            break;
+                        }
+                        changed = true;
+                    }
+                    _ => break,
+                }
+            } else {
+                if point.glyph_index == 0 {
+                    if !self.decrement_point(point)? {
+                        break;
+                    }
+                    changed = true;
+                    continue;
+                }
+                let idx = point.glyph_index.saturating_sub(1);
+                match page_text.glyph_char(idx) {
+                    Some(ch) if predicate(ch) => {
+                        if !self.decrement_point(point)? {
+                            break;
+                        }
+                        changed = true;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn clear_selection_state(&mut self, remember: bool) -> bool {
+        if self.selection_state.is_some() {
+            if remember {
+                self.remember_selection();
+            }
+            if let Some(state) = self.selection_state.take() {
+                self.visual_cursor = Some(state.head);
+                self.update_column_hint(state.head);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remember_selection(&mut self) {
+        if let Some(selection) = self.selection_state.as_ref() {
+            self.last_selection = Some(selection.normalized());
+        }
+    }
+
+    fn leave_visual_mode(&mut self, remember: bool) -> bool {
+        let mut changed = self.clear_selection_state(remember);
+        if self.visual_cursor.take().is_some() {
+            changed = true;
+        }
+        changed
+    }
+
+    fn restore_last_selection(&mut self) -> Result<bool> {
+        let snapshot = match self.last_selection.clone() {
+            Some(snapshot) => snapshot,
+            None => return Ok(false),
+        };
+        let start = self.clamp_point(snapshot.start)?;
+        let end = self.clamp_point(snapshot.end)?;
+        self.selection_state = Some(SelectionState {
+            anchor: start,
+            head: end,
+        });
+        self.visual_cursor = Some(end);
+        self.update_column_hint(end);
+        Ok(true)
+    }
+
+    fn swap_visual_cursor(&mut self) -> bool {
+        if let Some(state) = self.selection_state.as_mut() {
+            std::mem::swap(&mut state.anchor, &mut state.head);
+            let head = state.head;
+            self.visual_cursor = Some(head);
+            self.update_column_hint(head);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn build_selection_highlights(
+        &self,
+        snapshot: &SelectionSnapshot,
+        page_index: usize,
+    ) -> Option<Highlights> {
+        let (start, end) = snapshot.points();
+        if page_index < start.page || page_index > end.page {
+            return None;
+        }
+        let page_text = self.page_text_entry(page_index).ok()?;
+        let mut highlights = Highlights::default();
+        let start_idx = if page_index == start.page {
+            start.glyph_index.min(page_text.glyph_count())
+        } else {
+            0
+        };
+        let end_idx = if page_index == end.page {
+            end.glyph_index.min(page_text.glyph_count())
+        } else {
+            page_text.glyph_count()
+        };
+        if start_idx >= end_idx {
+            return None;
+        }
+        for glyph in page_text.glyphs[start_idx..end_idx].iter() {
+            if glyph.rect.is_valid() {
+                highlights.current.push(glyph.rect);
+            }
+        }
+        if highlights.is_empty() {
+            None
+        } else {
+            Some(highlights)
+        }
+    }
+
+    fn extract_selection_text(&self, snapshot: &SelectionSnapshot) -> Result<String> {
+        let (start, end) = snapshot.points();
+        let mut buffer = String::new();
+        let mut page = start.page;
+        while page <= end.page {
+            let page_text = self.page_text_entry(page)?;
+            let glyph_count = page_text.glyph_count();
+            let start_idx = if page == start.page {
+                start.glyph_index.min(glyph_count)
+            } else {
+                0
+            };
+            let end_idx = if page == end.page {
+                end.glyph_index.min(glyph_count)
+            } else {
+                glyph_count
+            };
+            if start_idx < end_idx {
+                let start_offset = page_text.boundary_offset(start_idx);
+                let end_offset = page_text.boundary_offset(end_idx);
+                if end_offset > start_offset && end_offset <= page_text.text.len() {
+                    if !buffer.is_empty() {
+                        buffer.push('\n');
+                    }
+                    buffer.push_str(&page_text.text[start_offset..end_offset]);
+                }
+            }
+            if page == end.page {
+                break;
+            }
+            page += 1;
+        }
+        Ok(buffer)
+    }
+
+    fn move_visual_cursor(&mut self, motion: SelectionMotion, count: usize) -> Result<bool> {
+        if self.info.page_count == 0 {
+            return Ok(false);
+        }
+        self.ensure_visual_cursor()?;
+        let mut cursor = match self.visual_cursor {
+            Some(point) => point,
+            None => return Ok(false),
+        };
+        let mut changed = false;
+        let steps = count.max(1);
+        match motion {
+            SelectionMotion::Left => {
+                changed = self.adjust_point(&mut cursor, -(steps as isize))?;
+            }
+            SelectionMotion::Right => {
+                changed = self.adjust_point(&mut cursor, steps as isize)?;
+            }
+            SelectionMotion::WordForward => {
+                changed = self.move_word(&mut cursor, steps, true)?;
+            }
+            SelectionMotion::WordBackward => {
+                changed = self.move_word(&mut cursor, steps, false)?;
+            }
+            SelectionMotion::LineStart => {
+                changed = self.move_to_line_boundary(&mut cursor, true)?;
+            }
+            SelectionMotion::LineEnd => {
+                changed = self.move_to_line_boundary(&mut cursor, false)?;
+            }
+            SelectionMotion::DocumentStart => {
+                let target_page = if steps > 1 {
+                    steps
+                        .saturating_sub(1)
+                        .min(self.info.page_count.saturating_sub(1))
+                } else {
+                    0
+                };
+                if cursor.page != target_page || cursor.glyph_index != 0 {
+                    cursor.page = target_page;
+                    cursor.glyph_index = 0;
+                    changed = true;
+                }
+            }
+            SelectionMotion::DocumentEnd => {
+                let target_page = self.info.page_count.saturating_sub(1);
+                let page_changed = cursor.page != target_page;
+                cursor.page = target_page;
+                let page_text = self.page_text_entry(cursor.page)?;
+                let target = page_text.glyph_count();
+                if page_changed || cursor.glyph_index != target {
+                    cursor.glyph_index = target;
+                    changed = true;
+                }
+            }
+            SelectionMotion::PageForward => {
+                changed = self.move_pages(&mut cursor, steps as isize)?;
+            }
+            SelectionMotion::PageBackward => {
+                changed = self.move_pages(&mut cursor, -(steps as isize))?;
+            }
+            SelectionMotion::Down => {
+                changed = self.move_lines(&mut cursor, steps as isize)?;
+            }
+            SelectionMotion::Up => {
+                changed = self.move_lines(&mut cursor, -(steps as isize))?;
+            }
+        }
+
+        if changed {
+            self.visual_cursor = Some(cursor);
+            self.update_column_hint(cursor);
+            if self.state.current_page != cursor.page {
+                self.state.current_page = cursor.page;
+                self.state.viewport.reset();
+            }
+            if let Some(state) = self.selection_state.as_mut() {
+                state.head = cursor;
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn new(
         info: DocumentInfo,
         backend: Arc<dyn DocumentBackend>,
@@ -466,6 +1209,10 @@ impl DocumentInstance {
             text_cache: Arc::new(Mutex::new(HashMap::new())),
             search_state: None,
             link_state: None,
+            selection_state: None,
+            visual_cursor: None,
+            last_selection: None,
+            visual_column_hint: 0.5,
         };
         let initial = instance.current_position();
         instance.jump_history.record_initial(initial);
@@ -513,6 +1260,10 @@ impl DocumentInstance {
         self.text_cache.lock().clear();
         self.search_state = None;
         self.link_state = None;
+        self.selection_state = None;
+        self.visual_cursor = None;
+        self.visual_column_hint = 0.5;
+        self.last_selection = None;
 
         if self.info.page_count == 0 {
             self.state.current_page = 0;
@@ -834,6 +1585,41 @@ impl DocumentInstance {
         }
     }
 
+    pub fn selection_highlights_for_current_page(&self) -> Option<Highlights> {
+        let selection = self.selection_state.as_ref()?;
+        let snapshot = selection.normalized();
+        self.build_selection_highlights(&snapshot, self.state.current_page)
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        let selection = self.selection_state.as_ref()?;
+        self.extract_selection_text(&selection.normalized()).ok()
+    }
+
+    pub fn visual_cursor_highlight(&self) -> Option<NormalizedRect> {
+        if self.selection_state.is_some() {
+            return None;
+        }
+        let point = self.visual_cursor?;
+        if point.page != self.state.current_page {
+            return None;
+        }
+        let page_text = self.page_text_entry(point.page).ok()?;
+        if page_text.glyphs.is_empty() {
+            return None;
+        }
+        let glyph_count = page_text.glyph_count();
+        if glyph_count == 0 {
+            return None;
+        }
+        let idx = point.glyph_index.min(glyph_count.saturating_sub(1));
+        page_text
+            .glyphs
+            .get(idx)
+            .map(|glyph| glyph.rect)
+            .filter(|rect| rect.is_valid())
+    }
+
     pub fn start_link_mode(&mut self) -> Result<()> {
         let entries = self.build_link_entries()?;
         let current_page = self.state.current_page;
@@ -1084,28 +1870,73 @@ fn quantize_scale(scale: f32) -> u32 {
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    NextPage { count: usize },
-    PrevPage { count: usize },
-    GotoPage { page: usize },
-    ScaleBy { factor: f32 },
+    NextPage {
+        count: usize,
+    },
+    PrevPage {
+        count: usize,
+    },
+    GotoPage {
+        page: usize,
+    },
+    ScaleBy {
+        factor: f32,
+    },
     ResetScale,
-    AdjustViewport { delta_x: f32, delta_y: f32 },
-    PutMark { key: char },
-    GotoMark { key: char },
-    SaveNamedMark { name: String },
-    GotoNamedMark { name: String },
-    Search { query: String },
-    SearchNext { count: usize },
-    SearchPrev { count: usize },
+    AdjustViewport {
+        delta_x: f32,
+        delta_y: f32,
+    },
+    PutMark {
+        key: char,
+    },
+    GotoMark {
+        key: char,
+    },
+    SaveNamedMark {
+        name: String,
+    },
+    GotoNamedMark {
+        name: String,
+    },
+    Search {
+        query: String,
+    },
+    SearchNext {
+        count: usize,
+    },
+    SearchPrev {
+        count: usize,
+    },
+    EnterVisualMode,
+    StartSelection,
+    MoveVisualCursor {
+        motion: SelectionMotion,
+        count: usize,
+    },
+    ClearSelection,
+    LeaveVisualMode,
+    RestoreSelection,
+    SwapVisualCursor,
     EnterLinkMode,
     LeaveLinkMode,
-    LinkNext { count: usize },
-    LinkPrev { count: usize },
+    LinkNext {
+        count: usize,
+    },
+    LinkPrev {
+        count: usize,
+    },
     ActivateLink,
     ToggleDarkMode,
-    SwitchDocument { index: usize },
-    CloseDocument { index: usize },
-    OpenDocument { path: PathBuf },
+    SwitchDocument {
+        index: usize,
+    },
+    CloseDocument {
+        index: usize,
+    },
+    OpenDocument {
+        path: PathBuf,
+    },
     JumpBackward,
     JumpForward,
 }
@@ -1125,7 +1956,7 @@ pub trait DocumentBackend: Send + Sync {
     fn outline(&self) -> Result<Vec<OutlineItem>> {
         Ok(Vec::new())
     }
-    fn page_text(&self, _page_index: usize) -> Result<String> {
+    fn page_text(&self, _page_index: usize) -> Result<PageText> {
         Err(anyhow!("text extraction not supported"))
     }
     fn search_page(&self, _page_index: usize, _query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
@@ -1242,6 +2073,10 @@ impl Session {
 
     pub fn active(&self) -> Option<&DocumentInstance> {
         self.documents.get(self.active)
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        self.active().and_then(|doc| doc.selection_text())
     }
 
     pub fn contains_document(&self, doc_id: DocumentId) -> bool {
@@ -1377,6 +2212,69 @@ impl Session {
             Command::SearchPrev { count } => {
                 if let Some(doc) = self.documents.get_mut(self.active) {
                     if doc.previous_search_match(count.max(1)).is_some() {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::EnterVisualMode => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.ensure_visual_cursor()? {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::StartSelection => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.start_selection()? {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::MoveVisualCursor { motion, count } => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.move_visual_cursor(motion, count.max(1))? {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::ClearSelection => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.clear_selection_state(true) {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::LeaveVisualMode => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.leave_visual_mode(true) {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::RestoreSelection => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.restore_last_selection()? {
+                        self.events
+                            .lock()
+                            .push(SessionEvent::RedrawNeeded(doc.info.id));
+                    }
+                }
+            }
+            Command::SwapVisualCursor => {
+                if let Some(doc) = self.documents.get_mut(self.active) {
+                    if doc.swap_visual_cursor() {
                         self.events
                             .lock()
                             .push(SessionEvent::RedrawNeeded(doc.info.id));
@@ -1657,8 +2555,24 @@ mod tests {
             })
         }
 
-        fn page_text(&self, page_index: usize) -> Result<String> {
-            Ok(format!("This is sample page {} with keyword", page_index))
+        fn page_text(&self, page_index: usize) -> Result<PageText> {
+            let content = format!("This is sample page {} with keyword", page_index);
+            let mut offset = 0;
+            let mut glyphs = Vec::new();
+            for ch in content.chars() {
+                let start = offset;
+                offset += ch.len_utf8();
+                glyphs.push(TextGlyph {
+                    range: start..offset,
+                    rect: NormalizedRect {
+                        left: 0.0,
+                        top: 0.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                    },
+                });
+            }
+            Ok(PageText::new(content, glyphs))
         }
 
         fn search_page(&self, page_index: usize, query: &str) -> Result<Vec<Vec<NormalizedRect>>> {
@@ -1872,8 +2786,8 @@ mod tests {
             })
         }
 
-        fn page_text(&self, _page_index: usize) -> Result<String> {
-            Ok(String::new())
+        fn page_text(&self, _page_index: usize) -> Result<PageText> {
+            Ok(PageText::new(String::new(), Vec::new()))
         }
 
         fn search_page(
